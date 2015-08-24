@@ -20,6 +20,19 @@ class ZXCFile
   end
 end
 class ZXCFREEZE
+  class InnerClass
+    attr_accessor :value
+    def initialize(value)
+      @value = value
+    end
+    def FREEZE(serializer)
+      [value]
+    end
+    def self.THAW(serializer,*a)
+      new(*a)
+    end
+  end
+
   attr_accessor :z,:x,:c,:serializer
   def initialize(z,x,c)
     @z = z
@@ -54,6 +67,14 @@ class SerealPerlObject
     @class
   end
 end
+Time.class_eval do
+  def FREEZE(serializer)
+    to_a
+  end
+  def self.THAW(serializer,*a)
+    mktime(*a)
+  end
+end
 
 class Test::Unit::TestCase
   def recode(obj,safe = false)
@@ -80,15 +101,30 @@ class Test::Unit::TestCase
     assert Sereal.encode(a,Sereal::COPY|Sereal::REF).length < Sereal.encode(a,Sereal::REF).length
   end
 
+  def test_nested_class_thaw
+    original = ZXCFREEZE::InnerClass.new("hello")
+    recoded = Sereal.decode(Sereal.encode(original,Sereal::THAW),Sereal::THAW)
+    assert_equal(ZXCFREEZE::InnerClass, recoded.class)
+    assert_equal(original.value,recoded.value)
+  end
+
   def test_thaw
-    x = ZXCFREEZE.new(6,7,8)
-    y = ZXCFREEZE.new(6,7,10)
-    frozen = x.FREEZE(Sereal::FREEZER)
-    recoded = Sereal.decode(Sereal.encode(x,Sereal::THAW),Sereal::THAW)
-    assert_raise(TypeError) do
-      recoded = Sereal.decode(Sereal.encode(x,Sereal::THAW))
+    [ Sereal::THAW,Sereal::THAW|Sereal::COPY].each do |flags|
+      x = [ZXCFREEZE.new(6,7,8),ZXCFREEZE.new(6,7,9),ZXCFREEZE.new(6,7,10)]
+      y = ZXCFREEZE.new(6,7,10)
+      frozen = x[0].FREEZE(Sereal::FREEZER)
+      recoded = Sereal.decode(Sereal.encode(x,flags),flags)
+      assert_raise(TypeError) do
+        recoded = Sereal.decode(Sereal.encode(x,flags))
+      end
+      assert_equal(frozen,recoded[0].FREEZE(Sereal::FREEZER))
     end
-    assert_equal(frozen,recoded.FREEZE(Sereal::FREEZER))
+  end
+
+  def test_thaw_tdata
+    original = Time.now # Time is a T_DATA not a T_OBJECT
+    recoded = Sereal.decode(Sereal.encode(original,Sereal::THAW),Sereal::THAW)
+    assert_equal(original.to_a, recoded.to_a)
   end
 
   def test_references
@@ -125,15 +161,26 @@ class Test::Unit::TestCase
     end
   end
   def test_numbers
-    [0,1,2,3,4,16,17,2**31,2**32,2**60,2*64,0.1,Float(2**64),2.1**956].each do |x|
-      assert_equal recode(x),x
-      if x > 0
-        neg = -x
-        assert_equal recode(neg),neg
+    [0,1,2,3,4,15,16,17,2**30,2**31,2**32,2**61,(2**64)-1,0.1,Float(2**64),2.1**956].each do |i|
+      [i,-i].each do |x|
+        if (i > (2**63))
+          x = i
+        end
+        begin
+          assert_equal x,recode(x),"testing: #{x.to_s}"
+        rescue Exception => e
+          raise "failed to recode #{x} - #{e.message}"
+        end
       end
     end
   end
-
+  def test_numbers_end
+    [(2**64),-(2**64)].each do |x|
+      assert_raise(RangeError) do
+        recode(x);
+      end
+    end
+  end
   def test_nil
     assert_equal recode(nil),nil
   end

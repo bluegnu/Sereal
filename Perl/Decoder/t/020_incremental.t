@@ -15,7 +15,7 @@ BEGIN {
 
 use Sereal::TestSet qw(:all);
 
-use Test::More tests => 8 + 6 + ( 31 * 2 );
+use Test::More tests => 8 + 6 + ( 31 * 3 );
 
 # Simple test to see whether we can get the number of bytes consumed
 # and whether offset works
@@ -51,13 +51,16 @@ SCOPE: {
 SKIP: {
     my $have_enc = have_encoder_and_decoder();
     if (not $have_enc) {
-        skip "Need encoder for chunk tests", 31*2;
+        skip "Need encoder for chunk tests", 31 * 3;
     }
     else {
         require Sereal::Encoder;
-        Sereal::Encoder->import("encode_sereal");
+        Sereal::Encoder->import("encode_sereal", "SRL_ZLIB");
 
-        for my $tuple ( ['raw' => [] ], [ snappy_incr => [ { snappy_incr => 1 } ] ] ) {
+        for my $tuple ( [ raw         => [] ],
+                        [ snappy_incr => [ { snappy_incr => 1 } ] ],
+                        [ zlib        => [ { compress => SRL_ZLIB() } ] ] )
+        {
             my ($name, $opts)= @$tuple;
             my $data;
             my $n = 30;
@@ -76,7 +79,7 @@ SKIP: {
             };
             my $err = $@ || 'Zombie error';
             ok($ok, "incremental decoder ($name) had no hissy fit")
-                or note("Error: $err");
+                or note("Error: $err. Data structures decoded up to that point:\n" . Data::Dumper::Dumper(\@out));
 
             is($out[$_-1], $_, "Decoding multiple packets from single string works ($name: $_)")
                 for 1..$n;

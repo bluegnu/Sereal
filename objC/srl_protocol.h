@@ -142,7 +142,7 @@
 /* magic string, protocol version and encoding information */
 #define SRL_MAGIC_STRING                "=srl"          /* Magic string for header. Every packet starts with this */
 #define SRL_MAGIC_STRLEN                4               /* Length of SRL_MAGIC_STRING */
-#define SRL_MAGIC_STRING_LILIPUTIAN     0x6c72733d      /* SRL_MAGIC_STRING as a little endian integer */
+#define SRL_MAGIC_STRING_UINT_LE     0x6c72733d      /* SRL_MAGIC_STRING as a little endian integer */
 
 #define SRL_PROTOCOL_VERSION            ( 2 )
 #define SRL_PROTOCOL_VERSION_BITS       ( 4 )           /* how many bits we use for the version, the rest go to the encoding */
@@ -233,6 +233,6 @@
 
 /* TODO */
 
-#define SRL_SET_FBIT(where) ((where) |= SRL_HDR_TRACK_FLAG)
+#define SRL_SET_TRACK_FLAG(where) ((where) |= SRL_HDR_TRACK_FLAG)
 
 #endif

@@ -5,22 +5,37 @@ use warnings;
 use Carp qw/croak/;
 use XSLoader;
 
-our $VERSION = '2.03'; # Don't forget to update the TestCompat set for testing against installed decoders!
+our $VERSION = '3.005_001'; # Don't forget to update the TestCompat set for testing against installed decoders!
+our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
 
 # not for public consumption, just for testing.
 (my $num_version = $VERSION) =~ s/_//;
-my $TestCompat = [ map sprintf("%.2f", $_/100), reverse( 200 .. int($num_version * 100) ) ]; # compat with 2.00 to ...
+my $TestCompat = [ map sprintf("%.2f", $_/100), reverse( 300 .. int($num_version * 100) ) ]; # compat with 3.00 to ...
 sub _test_compat {return(@$TestCompat, $VERSION)}
 
+# Make sure to keep these constants in sync with the C code in srl_encoder.c.
+# I know they could be exported from C using things like ExtUtils::Constant,
+# but that's too much of a hassle for just three numbers.
+use constant SRL_UNCOMPRESSED => 0;
+use constant SRL_SNAPPY       => 1;
+use constant SRL_ZLIB         => 2;
+
 use Exporter 'import';
-our @EXPORT_OK = qw(encode_sereal encode_sereal_with_header_data);
+our @EXPORT_OK = qw(
+  encode_sereal
+  encode_sereal_with_header_data
+  sereal_encode_with_object
+  SRL_UNCOMPRESSED
+  SRL_SNAPPY
+  SRL_ZLIB
+);
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 # export by default if run from command line
 our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
 
 sub CLONE_SKIP {1}
 
-XSLoader::load('Sereal::Encoder', $VERSION);
+XSLoader::load('Sereal::Encoder', $XS_VERSION);
 
 1;
 
@@ -34,11 +49,15 @@ Sereal::Encoder - Fast, compact, powerful binary serialization
 
 =head1 SYNOPSIS
 
-  use Sereal::Encoder qw(encode_sereal);
-  
+  use Sereal::Encoder qw(encode_sereal sereal_encode_with_object);
+
   my $encoder = Sereal::Encoder->new({...options...});
   my $out = $encoder->encode($structure);
-  # alternatively:
+
+  # alternatively the functional interface:
+  $out = sereal_encode_with_object($encoder, $structure);
+
+  # much slower functional interface with no persistent objects:
   $out = encode_sereal($structure, {... options ...});
 
 =head1 DESCRIPTION
@@ -47,9 +66,11 @@ This library implements an efficient, compact-output, and feature-rich
 serializer using a binary protocol called I<Sereal>.
 Its sister module L<Sereal::Decoder> implements a decoder for this format.
 The two are released separately to allow for independent and safer upgrading.
+If you care greatly about performance, consider reading the L<Sereal::Performance>
+documentation after finishing this document.
 
 The Sereal protocol version emitted by this encoder implementation is currently
-protocol version 2 by default.
+protocol version 3 by default.
 
 The protocol specification and many other bits of documentation
 can be found in the github repository. Right now, the specification is at
@@ -58,6 +79,8 @@ there is a discussion of the design objectives in
 L<https://github.com/Sereal/Sereal/blob/master/README.pod>, and the output
 of our benchmarks can be seen at
 L<https://github.com/Sereal/Sereal/wiki/Sereal-Comparison-Graphs>.
+For more information on getting the best performance out of Sereal, have a look
+at the L</"PERFORMANCE"> section below.
 
 =head1 CLASS METHODS
 
@@ -70,7 +93,38 @@ encoder.
 Currently, the following options are recognized, none of them are on
 by default.
 
+=head3 compress
+
+If this option provided and true, compression of the document body is enabled.
+As of Sereal version 3, two different compression techniques are supported
+and can be enabled by setting C<compress> to the respective named
+constants (exportable from the C<Sereal::Encoder> module):
+Snappy (named constant: C<SRL_SNAPPY>),
+and Zlib (C<SRL_ZLIB>).
+For your convenience, there is also a C<SRL_UNCOMPRESSED>
+constant.
+
+If this option is set, then the Snappy-related options below
+are ignored. They are otherwise recognized for compatibility only.
+
+=head3 compress_threshold
+
+The size threshold (in bytes) of the uncompressed output below which
+compression is not even attempted even if enabled.
+Defaults to one kilobyte (1024 bytes). Set this to 0 and C<compress> to
+a non-C<SRL_UNCOMPRESSED> value to always attempt to compress.
+Note that the document will not be compressed if the resulting size
+will be bigger than the original size (even if C<compress_threshold> is 0).
+
+=head3 compress_level
+
+If Zlib compression is used, then this option will set a compression
+level from 1 (fastest) to 9 (best). Defaults to 6.
+
 =head3 snappy
+
+See also the C<compress> option. This option is provided only for
+compatibility with Sereal V1.
 
 If set, the main payload of the Sereal document will be compressed using
 Google's Snappy algorithm. This can yield anywhere from no effect
@@ -81,26 +135,29 @@ The decoder (version 0.04 and up) will know how to handle Snappy-compressed
 Sereal documents transparently.
 
 B<Note:> The C<snappy_incr> and C<snappy> options are identical in
-Sereal protocol V2 (the default). If using the C<use_protocol_v1> option
+Sereal protocol v2 and up (so by default). If using an older protocol version
+(see C<protocol_version> and C<use_protocol_v1> options below)
 to emit Sereal V1 documents, this emits non-incrementally decodable
 documents. See C<snappy_incr> in those cases.
 
 =head3 snappy_incr
 
-Same as the C<snappy> option for default (Sereal V2) operation.
+See also the C<compress> option. This option is provided only for
+compatibility with Sereal V1.
 
-In Sereal V1, enables a version of the snappy protocol which is suitable for
+Same as the C<snappy> option for default operation (that is in Sereal v2 or up).
+
+In Sereal V1, enables a version of the Snappy protocol which is suitable for
 incremental parsing of packets. See also the C<snappy> option above for
 more details.
 
 =head3 snappy_threshold
 
-The size threshold (in bytes) of the uncompressed output below which
-snappy compression is not even attempted even if enabled.
-Defaults to one kilobyte (1024 bytes). Set to 0 and C<snappy> to enabled
-to always compress.
-Note that the document will not be compressed if the resulting size
-will be bigger than the original size (even if snappy_threshold is 0).
+See also the C<compress> option. This option is provided only for
+compatibility with Sereal V1.
+
+This option is a synonym for the C<compress_threshold> option,
+but only if Snappy compression is enabled.
 
 =head3 croak_on_bless
 
@@ -117,7 +174,7 @@ C<no_bless_objects>.
 
 =head3 freeze_callbacks
 
-This option is new in Sereal v2 and needs a Sereal v2 decoder.
+This option was introduced in Sereal v2 and needs a Sereal v2 decoder.
 
 If this option is set, the encoder will check for and possibly invoke
 the C<FREEZE> method on any object in the input data. An object that
@@ -128,7 +185,7 @@ are documented below under L</"FREEZE/THAW CALLBACK MECHANISM">.
 Beware that using this functionality means a significant slowdown for
 object serialization. Even when serializing objects without a C<FREEZE>
 method, the additional method look up will cost a small amount of runtime.
-Yes, C<Sereal::Encoder> is so fast that is may make a difference.
+Yes, C<Sereal::Encoder> is so fast that this may make a difference.
 
 =head3 no_bless_objects
 
@@ -179,6 +236,30 @@ do so.
 Do note that the setting is somewhat approximate. Setting it to 10000 may break at
 somewhere between 9997 and 10003 nested structures depending on their types.
 
+=head3 canoncial
+
+Enable all options which are related to producing canonical output, so that
+two strucutures with similar contents produce the same serialized form.
+
+See the caveats elsewhere in this document about producing canonical output.
+
+Currently sets the default for the following parameters: C<canonical_refs>
+and C<sort_keys>. If the option is explicitly set then this setting is ignored.
+More options may be added in the future.
+
+You are warned that use of this option may incur additional performance penalties
+in a future release by enabling other options than those listed here.
+
+=head3 canonical_refs
+
+Normally C<Sereal::Encoder> will ARRAYREF and HASHREF tags when the item contains
+less than 16 items, and and is not referenced more than once. This flag will
+override this optimization and use a standard REFN ARRAY style tag output. This
+is primarily useful for producing canoncial output and for testing Sereal itself.
+
+See L</CANONICAL REPRESENTATION> for why you might want to use this, and
+for the various caveats involved.
+
 =head3 sort_keys
 
 Normally C<Sereal::Encoder> will output hashes in whatever order is convenient,
@@ -200,8 +281,8 @@ gain if you plan to serialize multiple similar data structures, but destroy
 it if you serialize a single very large data structure just once to free
 the memory.
 
-See L</NON-CANONICAL> for why you might want to use this, and for the
-various caveats involved.
+See L</CANONICAL REPRESENTATION> for why you might want to use this, and
+for the various caveats involved.
 
 =head3 no_shared_hashkeys
 
@@ -255,7 +336,19 @@ but at the cost of potential action at a distance due to the aliasing.
 I<Beware:> The test suite currently does not cover this option as well as it
 probably should. Patches welcome.
 
+=head3 protocol_version
+
+Specifies the version of the Sereal protocol to emit. Valid are integers
+between 1 and the current version. If not specified, the most recent protocol
+version will be used. See also C<use_protocol_v1>:
+
+It is strongly advised to use the latest protocol version outside of
+migration periods.
+
 =head3 use_protocol_v1
+
+This option is deprecated in favour of the C<protocol_version> option (see
+above).
 
 If set, the encoder will emit Sereal documents following protocol version 1.
 This is strongly discouraged except for temporary
@@ -267,9 +360,24 @@ compatibility/migration purposes.
 
 Given a Perl data structure, serializes that data structure and returns a
 binary string that can be turned back into the original data structure by
-L<Sereal::Decoder>.
+L<Sereal::Decoder>. The method expects a data structure to serialize as first
+argument, optionally followed by a header data structure.
+
+A header is intended for embedding small amounts of meta data, such as routing
+information, in a document that allows users to avoid deserializing main body
+needlessly.
 
 =head1 EXPORTABLE FUNCTIONS
+
+=head2 sereal_encode_with_object
+
+The functional interface that is equivalent to using C<encode>. Takes an
+encoder object reference as first argument, followed by a data structure
+and optional header to serialize.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead.
 
 =head2 encode_sereal
 
@@ -277,13 +385,39 @@ The functional interface that is equivalent to using C<new> and C<encode>.
 Expects a data structure to serialize as first argument, optionally followed
 by a hash reference of options (see documentation for C<new()>).
 
-The functional interface is marginally slower than the OO interface since
+This function cannot be used for encoding a data structure with a header.
+See C<encode_sereal_with_header_data>.
+
+This functional interface is significantly slower than the OO interface since
+it cannot reuse the encoder object.
+
+=head2 encode_sereal_with_header_data
+
+The functional interface that is equivalent to using C<new> and C<encode>.
+Expects a data structure and a header to serialize as first and second arguments,
+optionally followed by a hash reference of options (see documentation for C<new()>).
+
+This functional interface is significantly slower than the OO interface since
 it cannot reuse the encoder object.
 
 =head1 PERFORMANCE
 
+See L<Sereal::Performance> for detailed considerations on performance
+tuning. Let it just be said that:
+
+B<If you care about performance at all, then use L</sereal_encode_with_object> or the
+OO interface instead of L</encode_sereal>. It's a significant difference
+in performance if you are serializing small data structures.>
+
 The exact performance in time and space depends heavily on the data structure
-to be serialized. For ready-made comparison scripts, see the
+to be serialized. Often there is a trade-off between space and time. If in doubt,
+do your own testing and most importantly ALWAYS TEST WITH REAL DATA. If you
+care purely about speed at the expense of output size, you can use the
+C<no_shared_hashkeys> option for a small speed-up. If you need smaller output at
+the cost of higher CPU load and more memory used during encoding/decoding,
+try the C<dedupe_strings> option and enable Snappy compression.
+
+For ready-made comparison scripts, see the
 F<author_tools/bench.pl> and F<author_tools/dbench.pl> programs that are part
 of this distribution. Suffice to say that this library is easily competitive
 in both time and space efficiency with the best alternatives.
@@ -308,16 +442,16 @@ Here is a contrived example of a class implementing the C<FREEZE> / C<THAW> mech
 
   package
     File;
-  
+
   use Moo;
-  
+
   has 'path' => (is => 'ro');
   has 'fh' => (is => 'rw');
-  
+
   # open file handle if necessary and return it
   sub get_fh {
     my $self = shift;
-    # This could also with fancier Moo(se) syntax
+    # This could also be done with fancier Moo(se) syntax
     my $fh = $self->fh;
     if (not $fh) {
       open $fh, "<", $self->path or die $!;
@@ -325,7 +459,7 @@ Here is a contrived example of a class implementing the C<FREEZE> / C<THAW> mech
     }
     return $fh;
   }
-  
+
   sub FREEZE {
     my ($self, $serializer) = @_;
     # Could switch on $serializer here: JSON, CBOR, Sereal, ...
@@ -334,7 +468,7 @@ Here is a contrived example of a class implementing the C<FREEZE> / C<THAW> mech
     # to recreate.
     return $self->path;
   }
-  
+
   sub THAW {
     my ($class, $serializer, $data) = @_;
     # Turn back into object.
@@ -360,29 +494,73 @@ C<Sereal::Encoder> objects will become a reference to undef in the new
 thread. This might change in a future release to become a full clone
 of the encoder object.
 
-=head1 NON-CANONICAL 
+=head1 CANONICAL REPRESENTATION
 
 You might want to compare two data structures by comparing their serialized
 byte strings.  For that to work reliably the serialization must take extra
 steps to ensure that identical data structures are encoded into identical
 serialized byte strings (a so-called "canonical representation").
 
-Currently the Sereal encoder I<does not> provide a mode that will reliably
-generate a canonical representation of a data structure. The reasons are many
-and sometimes subtle.
+Unfortunately in Perl there is no such thing as a "canonical representation".
+Most people are interested in "structural equivalence" but even that is less
+well defined than most people think. For instance in the following example:
 
-Sereal does support some use-cases however. In this section we attempt to outline
-the issues well enough for you to decide if it is suitable for your needs.
+    my $array1= [ 0, 0 ];
+    my $array2= do {
+        my $zero= 0;
+        sub{ \@_ }->($zero,$zero);
+    };
+
+the question of whether C<$array1> is structurally equivalent to C<$array2>
+is a subjective one. Sereal for instance would B<NOT> consider them
+equivalent but C<Test::Deep> would.  There are many examples of this in
+Perl. Simply stringifying a number technically changes the scalar. Storable
+would notice this, but Sereal generally would not.
+
+Despite this as of 3.002 the Sereal encoder supports a "canonical" option
+which will make a "best effort" attempt at producing a canonical
+representation of a data structure.  This mode is actually a combination of
+several other modes which may also be enabled independently, and as and when
+we add new options to the encoder that would assist in this regard then
+the C<canonical> will also enable them. These options may come with a
+performance penalty so care should be taken to read the Changes file and
+test the peformance implications when upgrading a system that uses this
+option.
+
+It is important to note that using canonical representation to determine
+if two data structures are different is subject to false-positives. If
+two Sereal encodings are identical you can generally assume that the
+two data structures are functionally equivalent from the point of view of
+normal Perl code (XS code might disagree). However if two Sereal
+encodings differ the data structures may actually be functionally
+equivalent.  In practice it seems the the false-positive rate is low,
+but your milage may vary.
+
+Some of the issues with producing a true canonical representation are
+outlined below:
 
 =over 4
 
 =item Sereal doesn't order the hash keys by default.
 
-This can be enabled via C<sort_keys>, see above.
+This can be enabled via the C<sort_keys>, which is itself enabled by
+C<canonical> option.
+
+=item Sereal output is sensitive to refcounts
+
+This can be somewhat mitigated by the use of C<canonical_refs>, see above.
 
 =item There are multiple valid Sereal documents that you can produce for the same Perl data structure.
 
-Just L<sorting hash keys|/sort_keys> is not enough. A trivial example is PAD bytes which
+Just L<sorting hash keys|/sort_keys> is not enough.  Some of the reasons
+are outlined below. These issues are especially relevant when considering
+language interoperability.
+
+=over 4
+
+=item PAD bytes
+
+A trivial example is PAD bytes which
 mean nothing and are skipped. They mostly exist for encoder optimizations to
 prevent certain nasty backtracking situations from becoming O(n) at the cost of
 one byte of output. An explicit canonical mode would have to outlaw them (or
@@ -391,6 +569,8 @@ refcount/weakref handing in the encoder while at the same time causing some
 operations to go from O(1) to a full memcpy of everything after the point of
 where we backtracked to. Nasty.
 
+=item COPY tag
+
 Another example is COPY. The COPY tag indicates that the next element is an
 identical copy of a previous element (which is itself forbidden from including
 COPY's other than for class names). COPY is purely internal. The Perl/XS
@@ -398,17 +578,22 @@ implementation uses it to share hash keys and class names. One could use it for
 other strings (theoretically), but doesn't for time-efficiency reasons. We'd
 have to outlaw the use of this (significant) optimization of canonicalization.
 
+=item REF representation
+
 Sereal represents a reference to an array as a sequence of
 tags which, in its simplest form, reads I<REF, ARRAY $array_length TAG1 TAG2 ...>.
 The separation of "REF" and "ARRAY" is necessary to properly implement all of
 Perl's referencing and aliasing semantics correctly. Quite frequently, however,
-your array is only reference once and plainly so. If it's also at most 15 elements
+your array is only referenced once and plainly so. If it's also at most 15 elements
 long, Sereal optimizes all of the "REF" and "ARRAY" tags, as well as the length
 into a special one byte ARRAYREF tag. This is a very significant optimization
 for common cases. This, however, does mean that most arrays up to 15 elements
 could be represented in two different, yet perfectly valid forms. ARRAYREF would
 have to be outlawed for a properly canonical form. The exact same logic
-applies to HASH vs. HASHREF.
+applies to HASH vs. HASHREF. This behavior can be overridden by the
+C<canonical_refs> option, which disables use of HASHREF and ARRAYREF.
+
+=item Numeric representation
 
 Similar to how Sereal can represent arrays and hashes in a full and a compact
 form. For small integers (between -16 and +15 inclusive), Sereal emits only
@@ -436,7 +621,66 @@ strings due to insignificant 'noise' in the floating point representation. Serea
 supports different floating point precisions and will generally choose the most
 compact that can represent your floating point number correctly.
 
-These issues are especially relevant when considering language interoperability.
+=back
+
+There's also a few cases where Sereal will produce different documents
+for values that you might think are the same thing, because if you
+e.g. compared them with C<eq> or C<==> in perl itself would think they
+were equivalent. However for the purposes of serialization they're not
+the same value.
+
+A good example of these cases is where L<Test::Deep> and Sereal's
+canonical mode differ. We have tests for some of these cases in
+F<t/030_canonical_vs_test_deep.t>. Here's the issues we've noticed so
+far:
+
+=over 4
+
+=item Sereal considers ASCII strings with the UTF-8 flag to be different from the same string without the UTF-8 flag
+
+Consider:
+
+    my $language_code = "en";
+
+v.s.:
+
+    my $language_code = "en";
+    utf8::upgrade($en);
+
+Sereal's canonical mode will encode these strings differently, as it
+should, since the UTF-8 flag will be passed along on interpolation.
+
+But this can be confusing if you're just getting some user-supplied
+ASCII strings that you may inadvertently toggle the UTF-8 flag on,
+e.g. because you're comparing an ASCII value in a database to a value
+submitted in a UTF-8 web form.
+
+=item Sereal will encode strings that look like numbers as strings, unless they've been used in numeric context
+
+I.e. these values will be encoded differently, respectively:
+
+    my $IV_x = "12345";
+    my $IV_y = "12345" + 0;
+    my $NV_x = "12.345";
+    my $NV_y = "12.345" + 0;
+
+But as noted above something like Test::Deep will consider these to be
+the same thing.
+
+=back
+
+We might produce certain aggressive flags to the canonical mode in the
+future to deal with this. For the cases noted above some combination
+of turning the UTF-8 flag on on all strings, or stripping it from
+strings that have it but are ASCII-only would "work", similarly we
+could scan strings to see if they match C<looks_like_number()> and if
+so numify them.
+
+This would produce output that either would be a lot bigger (having to
+encode all numbers as strings), or would be more expensive to generate
+(having to scan strings for numeric or non-ASCII context), and for
+some cases like the UTF-8 flag munging wouldn't be suitable for
+general use outside of canonicialization.
 
 =back
 
@@ -444,7 +688,7 @@ Often, people don't actually care about "canonical" in the strict sense
 required for real I<identity> checking. They just require a best-effort sort of
 thing for caching. But it's a slippery slope!
 
-In a nutshell, the C<sort_keys> option may be sufficient for an application
+In a nutshell, the C<canonical> option may be sufficient for an application
 which is simply serializing a cache key, and thus there's little harm in an
 occasional false-negative, but think carefully before applying Sereal in other
 use-cases.
@@ -462,7 +706,7 @@ L<https://groups.google.com/forum/?fromgroups#!forum/sereal-announce>
 Sereal development list:
 L<https://groups.google.com/forum/?fromgroups#!forum/sereal-dev>
 
-=head1 AUTHORS
+=head1 AUTHORS AND CONTRIBUTORS
 
 Yves Orton E<lt>demerphq@gmail.comE<gt>
 
@@ -477,6 +721,12 @@ Rafaël Garcia-Suarez
 Tim Bunce
 
 Daniel Dragan E<lt>bulkdd@cpan.orgE<gt> (Windows support and bugfixes)
+
+Zefram
+
+Borislav Nikolov
+
+Ivan Kruglov E<lt>ivan.kruglov@yahoo.comE<gt>
 
 Some inspiration and code was taken from Marc Lehmann's
 excellent L<JSON::XS> module due to obvious overlap in

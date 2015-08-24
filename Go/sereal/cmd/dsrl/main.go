@@ -2,11 +2,12 @@ package main
 
 import (
 	"flag"
-	"github.com/Sereal/Sereal/Go/sereal"
-	"github.com/davecgh/go-spew/spew"
 	"io/ioutil"
 	"log"
 	"os"
+
+	"github.com/Sereal/Sereal/Go/sereal"
+	"github.com/davecgh/go-spew/spew"
 )
 
 func process(fname string, b []byte) {
@@ -17,7 +18,12 @@ func process(fname string, b []byte) {
 	err := d.Unmarshal(b, &i)
 
 	if err != nil {
-		log.Fatalf("error processing %s: %s", fname, err)
+		switch e := err.(type) {
+		case sereal.ErrCorrupt:
+			log.Fatalf("error processing %s: %s (%s)", fname, e, e.Err)
+		default:
+			log.Fatalf("error processing %s: %s", fname, e)
+		}
 	}
 
 	spew.Dump(i)

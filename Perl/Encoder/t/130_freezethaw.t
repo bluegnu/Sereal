@@ -1,7 +1,7 @@
 #!perl
 use strict;
 use warnings;
-# most be loaded before Sereal::TestSet
+# must be loaded before Sereal::TestSet
 use Sereal::Encoder qw(encode_sereal);
 use Sereal::Encoder::Constants qw(:all);
 use File::Spec;
@@ -15,6 +15,12 @@ BEGIN {
 }
 
 use Sereal::TestSet qw(:all);
+
+my $ok = have_encoder_and_decoder();
+if (not $ok) {
+    plan skip_all => 'Did not find right version of decoder';
+    exit 0;
+}
 
 my $thaw_called = 0;
 my $freeze_called = 0;
@@ -55,13 +61,6 @@ package main;
 my $enc = Sereal::Encoder->new({freeze_callbacks => 1});
 my $srl = $enc->encode(Foo->new());
 ok($freeze_called, "FREEZE was invoked");
-
-
-my $run_decoder_tests = have_encoder_and_decoder();
-if (not $run_decoder_tests) {
-  done_testing();
-  exit;
-}
 
 
 # Simple round-trip test

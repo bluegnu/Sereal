@@ -2,12 +2,18 @@ package Sereal;
 use 5.008;
 use strict;
 use warnings;
-our $VERSION = '2.030';
-use Sereal::Encoder 2.03 qw(encode_sereal);
-use Sereal::Decoder 2.03 qw(decode_sereal looks_like_sereal);
+our $VERSION = '3.005_001';
+our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
+use Sereal::Encoder 3.005_001 qw(encode_sereal sereal_encode_with_object);
+use Sereal::Decoder 3.005_001 qw(decode_sereal looks_like_sereal sereal_decode_with_object);
 
 use Exporter 'import';
-our @EXPORT_OK = qw(encode_sereal decode_sereal looks_like_sereal);
+our @EXPORT_OK = qw(
+  encode_sereal decode_sereal
+  looks_like_sereal
+  sereal_encode_with_object
+  sereal_decode_with_object
+);
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 # export by default if run from command line
 our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
@@ -24,8 +30,15 @@ Sereal - Fast, compact, powerful binary (de-)serialization
 
 =head1 SYNOPSIS
 
-  use Sereal qw(encode_sereal decode_sereal looks_like_sereal);
-  
+  use Sereal qw(encode_sereal decode_sereal
+                sereal_encode_with_object
+                sereal_decode_with_object
+                looks_like_sereal);
+  # Note: For performance reasons, you should prefer the OO interface,
+  #       or sereal_(en|de)code_with_object over the stateless
+  #       encode_sereal/decode_sereal functions.
+  #       See the Sereal::Performance documentation for details.
+
 =head1 DESCRIPTION
 
 I<Sereal> is an efficient, compact-output, binary and feature-rich
@@ -54,12 +67,16 @@ L<https://github.com/Sereal/Sereal/wiki/Sereal-Comparison-Graphs>.
 
 It is recommended to use the object-oriented interface of
 C<Sereal::Encoder> and C<Sereal::Decoder> if you care about
-performance.
+performance. For detailed performance considerations,
+see L<Sereal::Performance>.
 
-You can optionally import three functions from C<Sereal>.
+You can optionally import five functions from C<Sereal>.
 C<encode_sereal> is the same function as L<Sereal::Encoder>'s
 C<encode_sereal> function. C<decode_sereal> and C<looks_like_sereal>
 are the same as L<Sereal::Decoder>'s functions of the same names.
+Finally, you can import the advanced functional interface
+C<sereal_encode_with_object> and C<sereal_decode_with_object>.
+Again, see L<Sereal::Performance> for information about those.
 
 After loading the C<Sereal> module, both C<Sereal::Encoder> and
 C<Sereal::Decoder> are guaranteed to be loaded, so you can use
@@ -88,6 +105,11 @@ This module was originally developed for Booking.com.
 With approval from Booking.com, this module was generalized
 and published on CPAN, for which the authors would like to express
 their gratitude.
+
+=head1 LICENSE
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself.
 
 =head1 COPYRIGHT AND LICENSE
 

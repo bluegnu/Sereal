@@ -4,25 +4,46 @@ use warnings;
 use Data::Dumper;
 
 use Getopt::Long qw(GetOptions);
+our @constants;
 BEGIN {
-    my $err;
-    eval '
-        use Sereal::Encoder::Constants qw(:all);
-        1;
-    ' or do { $err= $@; eval '
-        use Sereal::Decoder::Constants qw(:all);
-        1;
-    ' } or die "No encoder/decoder constants: $err\n$@";
+    my $add_use_blib= "";
+    my $use= "";
+    my @check;
+    for my $type ("Decoder","Encoder") {
+        if (-e "blib/lib/Sereal/$type/Constants.pm") {
+            $add_use_blib="use blib;";
+            @check= ($type);
+            last;
+        }
+        push @check, $type;
+    }
+
+    my @err;
+    foreach my $check (@check) {
+        if (eval(my $code= sprintf '
+                %s
+                use Sereal::%s::Constants qw(:all);
+                @constants= @Sereal::%s::Constants::EXPORT_OK;
+                print "Loaded constants from $INC{q(Sereal/%s/Constants.pm)}\n";
+                1;
+            ', $add_use_blib, ($check) x 3))
+        {
+            @err= ();
+            last;
+        } else {
+            push @err, "Error:",$@ || "Zombie Error","\nCode:\n$code";
+        }
+    }
+    die @err if @err;
 }
 
 my $done;
 my $data;
 my $hlen;
 my $indent = "";
-my %const_names = map {$_ => eval "$_"} @Sereal::Constants::EXPORT_OK;
 
 sub parse_header {
-  $data =~ s/^(=srl)(.)// or die "invalid header: $data";
+  $data =~ s/^(=[s\xF3]rl)(.)// or die "invalid header: $data";
   $done .= $1 . $2;
   my $flags = $2;
   my $len = varint();
@@ -44,9 +65,13 @@ sub parse_header {
   else {
     print "Empty Header.\n";
   }
+
   my $encoding= ord($flags) & SRL_PROTOCOL_ENCODING_MASK;
 
-  if ($encoding == SRL_PROTOCOL_ENCODING_SNAPPY) {
+  printf "%i %i %i\n", $encoding, ord(SRL_PROTOCOL_ENCODING_MASK), ord($flags);
+  if ($encoding == SRL_PROTOCOL_ENCODING_RAW) {
+    print "Header says: Document body is uncompressed.\n";
+  } elsif ($encoding == SRL_PROTOCOL_ENCODING_SNAPPY) {
     print "Header says: Document body is Snappy-compressed.\n";
     require Compress::Snappy;
     my $out = Compress::Snappy::decompress($data);
@@ -57,7 +82,14 @@ sub parse_header {
     require Compress::Snappy;
     my $out = Compress::Snappy::decompress($data);
     $data = $out;
-  } elsif ($encoding) {
+  } elsif ($encoding == SRL_PROTOCOL_ENCODING_ZLIB) {
+    print "Header says: Document body is ZLIB-compressed.\n";
+    my $uncompressed_len = varint();
+    my $compressed_len = varint();
+    require Compress::Zlib;
+    my $out = Compress::Zlib::uncompress($data);
+    $data = $out;
+  } else {
     die "Invalid encoding '" . ($encoding >> SRL_PROTOCOL_VERSION_BITS) . "'";
   }
   $hlen= length($done);
@@ -77,9 +109,9 @@ sub parse_double {
     return unpack("d",$v);
 }
 sub parse_long_double {
-    $len_D||= eval { length(pack("D",0)) };
+    $len_D ||= eval { length(pack("D",0.0)) };
     die "Long double not supported" unless $len_D;
-    my $v= substr($data,0,$len_D,"");
+    my $v= substr($data, 0, $len_D, "");
     $done .= $v;
     return unpack("D",$v);
 }
@@ -101,6 +133,9 @@ sub parse_sv {
 
   if ($o == SRL_HDR_VARINT) {
     printf "VARINT: %u\n", varint();
+  }
+  elsif ($o == SRL_HDR_ZIGZAG) {
+    printf "ZIGZAG: %d\n", zigzag();
   }
   elsif (SRL_HDR_POS_LOW <= $o && $o <= SRL_HDR_POS_HIGH) {
     printf "POS: %u\n", $o;
@@ -159,6 +194,9 @@ sub parse_sv {
     printf "HASH";
     parse_hv($ind);
   }
+  elsif ($o == SRL_HDR_CANONICAL_UNDEF) {
+    printf "CANONICAL_UNDEF\n";
+  }
   elsif ($o == SRL_HDR_UNDEF) {
     printf "UNDEF\n";
   }
@@ -213,7 +251,8 @@ sub parse_sv {
   }
   else {
     printf "<UNKNOWN>\n";
-    die "unsupported type: $o ($t): $const_names{$o}";
+    die sprintf "unsupported type: 0x%02x (%d) %s: %s", $o, $o,
+        Data::Dumper::qquote($t), Data::Dumper->new([$TAG_INFO_ARRAY[$o]])->Terse(1)->Dump();
   }
   return 0;
 }
@@ -224,22 +263,18 @@ sub parse_av {
   printf "(%u)\n", $len;
   $ind .= "  ";
   while ($len--) {
-    my $t = substr($data, 0, 1);
-    my $o = ord($t);
-      parse_sv($ind);
+    parse_sv($ind,\$len);
   }
 }
 
 sub parse_hv {
   my ($ind, $o) = @_;
   my $len = (defined $o ? $o & 15 : varint()) * 2;
-  printf "(%u)\n", $len;
+  printf "(%u)\n", $len / 2;
   $ind .= "  ";
   my $flipflop = 0;
   while ($len--) {
-    my $t = substr($data, 0, 1);
-    my $o = ord($t);
-    print( "               ", $ind, ($flipflop++ % 2 == 1 ? "VALUE" : "KEY"), ":\n" );
+    printf  "$fmt2%s:\n",("") x $lead_items, $ind, ($flipflop++ %2 == 1 ? "VALUE" : "KEY");
     parse_sv($ind."  ");
   }
 }
@@ -266,6 +301,14 @@ sub varint {
   return $x;
 }
 
+sub _zigzag {
+    my $n= $_[0];
+    return $n & 1 ? -(($n >> 1)+1) : ($n >> 1);
+}
+sub zigzag {
+    return _zigzag(varint());
+}
+
 GetOptions(
   my $opt = {},
   'e|stderr',
@@ -275,8 +318,6 @@ $| = 1;
 if ($opt->{e}) {
   select(STDERR);
 }
-
-#print Dumper \%const_names; exit;
 
 local $/ = undef;
 $data = <STDIN>;

@@ -42,7 +42,7 @@ extern "C" {
 #endif
 
 /* hv_backreferences_p is not marked as exported in embed.fnc in any perl */
-#if (PERL_VERSION >= 10 && !defined(WIN32) && !defined(_WIN32))
+#if (PERL_VERSION >= 10)
 #define HAS_HV_BACKREFS
 #endif
 
@@ -51,8 +51,7 @@ extern "C" {
 #include "srl_common.h"
 #include "ptable.h"
 #include "srl_buffer.h"
-
-#include "snappy/csnappy_compress.c"
+#include "srl_compress.h"
 
 /* The ENABLE_DANGEROUS_HACKS (passed through from ENV via Makefile.PL) enables
  * optimizations that may make the code so cozy with a particular version of the
@@ -100,12 +99,20 @@ SRL_STATIC_INLINE PTABLE_t *srl_init_freezeobj_svhash(srl_encoder_t *enc);
 SRL_STATIC_INLINE PTABLE_t *srl_init_weak_hash(srl_encoder_t *enc);
 SRL_STATIC_INLINE HV *srl_init_string_deduper_hv(pTHX_ srl_encoder_t *enc);
 
-#define SRL_GET_STR_DEDUPER_HV(enc) ( (enc)->string_deduper_hv == NULL     \
+/* Note: This returns an encoder struct pointer because it will
+ *       clone the current encoder struct if it's dirty. That in
+ *       turn means in order to access the output buffer, you need
+ *       to inspect the returned encoder struct. If necessary, it
+ *       will be cleaned up automatically by Perl, so don't bother
+ *       freeing it. */
+SRL_STATIC_INLINE srl_encoder_t *srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src, SV *user_header_src);
+
+#define SRL_GET_STR_DEDUPER_HV(enc) ( (enc)->string_deduper_hv == NULL          \
                                     ? srl_init_string_deduper_hv(aTHX_ enc)     \
                                    : (enc)->string_deduper_hv )
 
 #define SRL_GET_STR_PTR_SEENHASH(enc) ( (enc)->str_seenhash == NULL     \
-                                    ? srl_init_string_hash(enc)     \
+                                    ? srl_init_string_hash(enc)         \
                                    : (enc)->str_seenhash )
 
 #define SRL_GET_REF_SEENHASH(enc) ( (enc)->ref_seenhash == NULL     \
@@ -116,38 +123,133 @@ SRL_STATIC_INLINE HV *srl_init_string_deduper_hv(pTHX_ srl_encoder_t *enc);
                                     ? srl_init_weak_hash(enc)       \
                                    : (enc)->weak_seenhash )
 
-#define SRL_GET_FREEZEOBJ_SVHASH(enc) ( (enc)->freezeobj_svhash == NULL \
-                                        ? srl_init_freezeobj_svhash(enc)      \
+#define SRL_GET_FREEZEOBJ_SVHASH(enc) ( (enc)->freezeobj_svhash == NULL     \
+                                        ? srl_init_freezeobj_svhash(enc)    \
                                         : (enc)->freezeobj_svhash )
 
-#define CALL_SRL_DUMP_SV(enc, src) STMT_START {                         \
-    if (!(src)) {                                                       \
-        srl_buf_cat_char((enc), SRL_HDR_UNDEF);                         \
-    }                                                                   \
-    else                                                                \
-    if (SvTYPE((src)) < SVt_PVMG &&                                     \
-        SvREFCNT((src)) == 1 &&                                         \
-        !SvROK((src))                                                   \
-    ) {                                                                 \
-        if (SvPOKp((src))) {                                            \
-            srl_dump_svpv(aTHX_ (enc), (src));                          \
+#define SRL_ENC_UPDATE_BODY_POS(enc) SRL_UPDATE_BODY_POS(&(enc)->buf, (enc)->protocol_version)
+
+#ifndef MAX_CHARSET_NAME_LENGTH
+#    define MAX_CHARSET_NAME_LENGTH 2
+#endif
+
+#if PERL_VERSION == 10
+/*
+	Apparently regexes in 5.10 are "modern" but with 5.8 internals
+*/
+#ifndef RXf_PMf_STD_PMMOD_SHIFT
+#    define RXf_PMf_STD_PMMOD_SHIFT 12
+#endif
+#ifndef RE_EXTFLAGS
+#    define RX_EXTFLAGS(re)	((re)->extflags)
+#endif
+#ifndef RX_PRECOMP
+#    define RX_PRECOMP(re) ((re)->precomp)
+#endif
+#ifndef RX_PRELEN
+#    define RX_PRELEN(re) ((re)->prelen)
+#endif
+
+/* Maybe this is only on OS X, where SvUTF8(sv) exists but looks at flags that don't exist */
+#ifndef RX_UTF8
+#    define RX_UTF8(re) (RX_EXTFLAGS(re) & RXf_UTF8)
+#endif
+
+#elif defined(SvRX)
+#    define MODERN_REGEXP
+     /* With commit 8d919b0a35f2b57a6bed2f8355b25b19ac5ad0c5 (perl.git) and
+      * release 5.17.6, regular expression are no longer SvPOK (IOW are no longer
+      * considered to be containing a string).
+      * This breaks some of the REGEXP detection logic in srl_dump_sv, so
+      * we need yet another CPP define. */
+#    if PERL_VERSION > 17 || (PERL_VERSION == 17 && PERL_SUBVERSION >= 6)
+#        define REGEXP_NO_LONGER_POK
+#    endif
+#else
+#    define INT_PAT_MODS "msix"
+#    define RXf_PMf_STD_PMMOD_SHIFT 12
+#    define RX_PRECOMP(re) ((re)->precomp)
+#    define RX_PRELEN(re) ((re)->prelen)
+#    define RX_UTF8(re) ((re)->reganch & ROPT_UTF8)
+#    define RX_EXTFLAGS(re) ((re)->reganch)
+#    define RXf_PMf_COMPILETIME  PMf_COMPILETIME
+#endif
+
+#if defined(MODERN_REGEXP) && !defined(REGEXP_NO_LONGER_POK)
+#define DO_POK_REGEXP(enc, src, svt)                                    \
+        /* Only need to enter here if we have rather modern regexps,*/  \
+        /* but they're still POK (pre 5.17.6). */                       \
+        if (expect_false( svt == SVt_REGEXP ) ) {                       \
+            srl_dump_regexp(aTHX_ enc, src);                            \
         }                                                               \
-        else                                                            \
-        if (SvNOKp((src))) {                                            \
-            /* dump floats */                                           \
-            srl_dump_nv(aTHX_ (enc), (src));                            \
-        }                                                               \
-        else                                                            \
-        if (SvIOKp((src))) {                                            \
-            /* dump ints */                                             \
-            srl_dump_ivuv(aTHX_ (enc), (src));                          \
+        else
+#else
+#define DO_POK_REGEXP(enc, src, svt) /*no-op*/
+#endif
+
+#define _SRL_IF_SIMPLE_DIRECT_DUMP_SV(enc, src, svt)                    \
+    if (SvIOK(src)) {                                                   \
+    /* if its an integer its an integer */                              \
+        if (SvNOK(src) && SvPOK(src)) {                                 \
+            /* as far as I can tell the only strings which      */      \
+            /* set all three flags are engineering notation,    */      \
+            /* like "0E0" and friends - we especially need      */      \
+            /* to do this when the IV is 0, but we do it always */      \
+            /* if they put eng notation in, maybe then want it  */      \
+            /* out too. */                                              \
+            /* dump the string form */                                  \
+            srl_dump_svpv(aTHX_ enc, src);                              \
         }                                                               \
         else {                                                          \
-            srl_dump_sv(aTHX_ (enc), (src));                            \
+            /* dump ints */                                             \
+            srl_dump_ivuv(aTHX_ enc, src);                              \
         }                                                               \
-    } else {                                                            \
-        srl_dump_sv(aTHX_ (enc), (src));                                \
     }                                                                   \
+    else                                                                \
+    /* if its a float then its a float */                               \
+    if (SvNOK(src)) {                                                   \
+        /* dump floats */                                               \
+        srl_dump_nv(aTHX_ enc, src);                                    \
+    }                                                                   \
+    else                                                                \
+    /* The POKp, IOKp, NOKp checks below deal with PVLV */              \
+    /* if its POK or POKp, then we treat it as a string */              \
+    if (SvPOK(src) || SvPOKp(src)) {                                    \
+        DO_POK_REGEXP(enc,src,svt)                                      \
+        srl_dump_svpv(aTHX_ enc, src);                                  \
+    }                                                                   \
+    else                                                                \
+    /* if its IOKp then we treat it as an int */                        \
+    if (SvIOKp(src)) {                                                  \
+        srl_dump_ivuv(aTHX_ enc, src);                                  \
+    }                                                                   \
+    else                                                                \
+    /* if its NOKp then we treat it as an nv */                         \
+    if (SvNOKp(src)) {                                                  \
+        srl_dump_nv(aTHX_ enc, src);                                    \
+    }                                                                   \
+
+#define CALL_SRL_DUMP_SV(enc, src) STMT_START {                                     \
+    if (!(src)) {                                                                   \
+        srl_buf_cat_char(&(enc)->buf, SRL_HDR_CANONICAL_UNDEF); /* is this right? */\
+    }                                                                               \
+    else                                                                            \
+    {                                                                               \
+	svtype svt;								    \
+	SvGETMAGIC(src);							    \
+	svt= SvTYPE((src));							    \
+        if (svt < SVt_PVMG &&                                                       \
+            SvREFCNT((src)) == 1 &&                                                 \
+            !SvROK((src))                                                           \
+        ) {                                                                         \
+            _SRL_IF_SIMPLE_DIRECT_DUMP_SV(enc, src, svt)                            \
+            else {                                                                  \
+                srl_dump_sv(aTHX_ (enc), (src));                                    \
+            }                                                                       \
+        } else {                                                                    \
+            srl_dump_sv(aTHX_ (enc), (src));                                        \
+        }                                                                           \
+    }                                                                               \
 } STMT_END
 
 /* This is fired when we exit the Perl pseudo-block.
@@ -188,6 +290,7 @@ srl_clear_seen_hashes(pTHX_ srl_encoder_t *enc)
 void
 srl_clear_encoder(pTHX_ srl_encoder_t *enc)
 {
+    /* TODO I think this could just be made an assert. */
     if (!SRL_ENC_HAVE_OPER_FLAG(enc, SRL_OF_ENCODER_DIRTY)) {
         warn("Sereal Encoder being cleared but in virgin state. That is unexpected.");
     }
@@ -199,7 +302,7 @@ srl_clear_encoder(pTHX_ srl_encoder_t *enc)
     /* tmp_buf.start may be NULL for an unused tmp_buf, but so what? */
     enc->tmp_buf.pos = enc->tmp_buf.start;
 
-    SRL_SET_BODY_POS(enc, enc->buf.start);
+    SRL_SET_BODY_POS(&enc->buf, enc->buf.start);
 
     SRL_ENC_RESET_OPER_FLAG(enc, SRL_OF_ENCODER_DIRTY);
 }
@@ -213,7 +316,8 @@ srl_destroy_encoder(pTHX_ srl_encoder_t *enc)
     if (enc->tmp_buf.start != NULL)
         srl_buf_free_buffer(aTHX_ &enc->tmp_buf);
 
-    Safefree(enc->snappy_workmem);
+    srl_destroy_snappy_workmem(aTHX_ enc->snappy_workmem);
+
     if (enc->ref_seenhash != NULL)
         PTABLE_free(enc->ref_seenhash);
     if (enc->freezeobj_svhash != NULL)
@@ -249,6 +353,7 @@ srl_empty_encoder_struct(pTHX)
      * something nasty if it's unused. */
     enc->tmp_buf.start = NULL;
 
+    enc->protocol_version = SRL_PROTOCOL_VERSION;
     enc->recursion_depth = 0;
     enc->max_recursion_depth = DEFAULT_MAX_RECUR_DEPTH;
     enc->operational_flags = 0;
@@ -257,20 +362,30 @@ srl_empty_encoder_struct(pTHX)
     enc->weak_seenhash = NULL;
     enc->str_seenhash = NULL;
     enc->ref_seenhash = NULL;
-    enc->freezeobj_svhash = NULL;
     enc->snappy_workmem = NULL;
     enc->string_deduper_hv = NULL;
+
+    enc->freezeobj_svhash = NULL;
     enc->sereal_string_sv = NULL;
 
     return enc;
 }
 
+#define my_hv_fetchs(he,val,opt,idx) STMT_START {                   \
+    he = hv_fetch_ent(opt, options[idx].sv, 0, options[idx].hash);  \
+    if (he)                                                         \
+        val= HeVAL(he);                                             \
+    else                                                            \
+        val= NULL;                                                  \
+} STMT_END
+
 /* Builds the C-level configuration and state struct. */
 srl_encoder_t *
-srl_build_encoder_struct(pTHX_ HV *opt)
+srl_build_encoder_struct(pTHX_ HV *opt, sv_with_hash *options)
 {
     srl_encoder_t *enc;
-    SV **svp;
+    SV *val;
+    HE *he;
 
     enc = srl_empty_encoder_struct(aTHX);
     enc->flags = 0;
@@ -278,27 +393,41 @@ srl_build_encoder_struct(pTHX_ HV *opt)
     /* load options */
     if (opt != NULL) {
         int undef_unknown = 0;
-        int snappy_nonincr = 0;
+        int compression_format = 0;
         /* SRL_F_SHARED_HASHKEYS on by default */
-        svp = hv_fetchs(opt, "no_shared_hashkeys", 0);
-        if ( !svp || !SvTRUE(*svp) )
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_NO_SHARED_HASHKEYS);
+        if ( !val || !SvTRUE(val) )
             SRL_ENC_SET_OPTION(enc, SRL_F_SHARED_HASHKEYS);
 
         /* Needs to be before the snappy options */
-        svp = hv_fetchs(opt, "use_protocol_v1", 0);
-        if ( svp && SvTRUE(*svp) )
-            SRL_ENC_SET_OPTION(enc, SRL_F_USE_PROTO_V1);
+        /* enc->protocol_version defaults to SRL_PROTOCOL_VERSION. */
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_PROTOCOL_VERSION);
+        if (val && SvOK(val)) {
+            enc->protocol_version = SvUV(val);
+            if (enc->protocol_version < 1
+                || enc->protocol_version > SRL_PROTOCOL_VERSION)
+            {
+                croak("Specified Sereal protocol version ('%"UVuf") is invalid",
+                      (UV)enc->protocol_version);
+            }
+        }
+        else {
+            /* Compatibility with the old way to specify older protocol version */
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_USE_PROTOCOL_V1);
+            if ( val && SvTRUE(val) )
+                enc->protocol_version = 1;
+        }
 
-        svp = hv_fetchs(opt, "croak_on_bless", 0);
-        if ( svp && SvTRUE(*svp) )
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_CROAK_ON_BLESS);
+        if ( val && SvTRUE(val) )
             SRL_ENC_SET_OPTION(enc, SRL_F_CROAK_ON_BLESS);
 
-        svp = hv_fetchs(opt, "no_bless_objects", 0);
-        if ( svp && SvTRUE(*svp) )
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_NO_BLESS_OBJECTS);
+        if ( val && SvTRUE(val) )
             SRL_ENC_SET_OPTION(enc, SRL_F_NO_BLESS_OBJECTS);
 
-        svp = hv_fetchs(opt, "freeze_callbacks", 0);
-        if ( svp && SvTRUE(*svp) ) {
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_FREEZE_CALLBACKS);
+        if ( val && SvTRUE(val) ) {
             if (SRL_ENC_HAVE_OPTION(enc, SRL_F_NO_BLESS_OBJECTS))
                 croak("The no_bless_objects and freeze_callback_support "
                       "options are mutually exclusive");
@@ -306,74 +435,122 @@ srl_build_encoder_struct(pTHX_ HV *opt)
             enc->sereal_string_sv = newSVpvs("Sereal");
         }
 
-        svp = hv_fetchs(opt, "snappy", 0);
-        if ( svp && SvTRUE(*svp) ) {
-            /* incremental is the new black in V2 */
-            if (expect_true( !SRL_ENC_HAVE_OPTION(enc, SRL_F_USE_PROTO_V1) ))
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_COMPRESS);
+        if (val) {
+            compression_format = SvIV(val);
+
+            /* See also Encoder.pm's constants */
+            switch (compression_format) {
+            case 0: /* uncompressed */
+                break;
+            case 1:
                 SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL);
-            else {
-                snappy_nonincr = 1;
-                SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY);
+                break;
+            case 2:
+                SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_ZLIB);
+                if (enc->protocol_version < 3)
+                    croak("Zlib compression was introduced in protocol version 3 and you are asking for only version %i", (int)enc->protocol_version);
+
+                enc->compress_level = MZ_DEFAULT_COMPRESSION;
+                my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_COMPRESS_LEVEL);
+                if ( val && SvTRUE(val) ) {
+                    IV lvl = SvIV(val);
+                    if (expect_false( lvl < 1 || lvl > 10 )) /* Sekrit: compression lvl 10 is a miniz thing that doesn't exist in normal zlib */
+                        croak("'compress_level' needs to be between 1 and 9");
+                    enc->compress_level = lvl;
+                }
+                break;
+            default:
+                croak("Invalid Sereal compression format");
+            }
+        }
+        else {
+            /* Only bother with old compression options if necessary */
+
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_SNAPPY_INCR);
+            if ( val && SvTRUE(val) ) {
+                SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL);
+                compression_format = 1;
+            }
+             else {
+                /* snappy_incr >> snappy */
+                my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_SNAPPY);
+                if ( val && SvTRUE(val) ) {
+                    /* incremental is the new black in V2 */
+                    if (expect_true( enc->protocol_version > 1 ))
+                        SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL);
+                    else
+                        SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY);
+                    compression_format = 1;
+                }
             }
         }
 
-        svp = hv_fetchs(opt, "snappy_incr", 0);
-        if ( svp && SvTRUE(*svp) ) {
-            if (snappy_nonincr)
-                croak("'snappy' and 'snappy_incr' options are mutually exclusive");
-            SRL_ENC_SET_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL);
-        }
-
-        svp = hv_fetchs(opt, "undef_unknown", 0);
-        if ( svp && SvTRUE(*svp) ) {
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_UNDEF_UNKNOWN);
+        if ( val && SvTRUE(val) ) {
             undef_unknown = 1;
             SRL_ENC_SET_OPTION(enc, SRL_F_UNDEF_UNKNOWN);
         }
 
-        svp = hv_fetchs(opt, "sort_keys", 0);
-        if ( svp && SvTRUE(*svp) )
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_SORT_KEYS);
+        if ( !val )
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_CANONICAL);
+        if ( val && SvTRUE(val) )
             SRL_ENC_SET_OPTION(enc, SRL_F_SORT_KEYS);
 
-        svp = hv_fetchs(opt, "aliased_dedupe_strings", 0);
-        if ( svp && SvTRUE(*svp) )
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_CANONICAL_REFS);
+        if ( !val )
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_CANONICAL);
+        if ( val && SvTRUE(val) )
+            SRL_ENC_SET_OPTION(enc, SRL_F_CANONICAL_REFS);
+
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_ALIASED_DEDUPE_STRINGS);
+        if ( val && SvTRUE(val) )
             SRL_ENC_SET_OPTION(enc, SRL_F_ALIASED_DEDUPE_STRINGS | SRL_F_DEDUPE_STRINGS);
         else {
-            svp = hv_fetchs(opt, "dedupe_strings", 0);
-            if ( svp && SvTRUE(*svp) )
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_DEDUPE_STRINGS);
+            if ( val && SvTRUE(val) )
                 SRL_ENC_SET_OPTION(enc, SRL_F_DEDUPE_STRINGS);
         }
 
-        svp = hv_fetchs(opt, "stringify_unknown", 0);
-        if ( svp && SvTRUE(*svp) ) {
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_STRINGIFY_UNKNOWN);
+        if ( val && SvTRUE(val) ) {
             if (expect_false( undef_unknown ))
                 croak("'undef_unknown' and 'stringify_unknown' "
                       "options are mutually exclusive");
             SRL_ENC_SET_OPTION(enc, SRL_F_STRINGIFY_UNKNOWN);
         }
 
-        svp = hv_fetchs(opt, "warn_unknown", 0);
-        if ( svp && SvTRUE(*svp) ) {
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_WARN_UNKNOWN);
+        if ( val && SvTRUE(val) ) {
             SRL_ENC_SET_OPTION(enc, SRL_F_WARN_UNKNOWN);
-            if (SvIV(*svp) < 0)
+            if (SvIV(val) < 0)
                 SRL_ENC_SET_OPTION(enc, SRL_F_NOWARN_UNKNOWN_OVERLOAD);
         }
 
-        svp = hv_fetchs(opt, "snappy_threshold", 0);
-        if ( svp && SvOK(*svp) )
-            enc->snappy_threshold = SvIV(*svp);
-        else
-            enc->snappy_threshold = 1024;
+        if (compression_format) {
+            enc->compress_threshold = 1024;
+            my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_COMPRESS_THRESHOLD);
+            if ( val && SvOK(val) )
+                enc->compress_threshold = SvIV(val);
+            else if (compression_format == 1) {
+                /* compression_format==1 is some sort of Snappy */
+                my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_SNAPPY_THRESHOLD);
+                if ( val && SvOK(val) )
+                    enc->compress_threshold = SvIV(val);
+            }
+        }
 
-        svp = hv_fetchs(opt, "max_recursion_depth", 0);
-        if ( svp && SvTRUE(*svp))
-            enc->max_recursion_depth = SvUV(*svp);
+        my_hv_fetchs(he, val, opt, SRL_ENC_OPT_IDX_MAX_RECURSION_DEPTH);
+        if ( val && SvTRUE(val) )
+            enc->max_recursion_depth = SvUV(val);
     }
     else {
         /* SRL_F_SHARED_HASHKEYS on by default */
         SRL_ENC_SET_OPTION(enc, SRL_F_SHARED_HASHKEYS);
     }
 
-    DEBUG_ASSERT_BUF_SANE(enc);
+    DEBUG_ASSERT_BUF_SANE(&enc->buf);
     return enc;
 }
 
@@ -383,8 +560,17 @@ srl_build_encoder_struct_alike(pTHX_ srl_encoder_t *proto)
 {
     srl_encoder_t *enc;
     enc = srl_empty_encoder_struct(aTHX);
+
+    /* Copy the configuration-type, non-ephemeral attributes */
     enc->flags = proto->flags;
-    DEBUG_ASSERT_BUF_SANE(enc);
+    enc->max_recursion_depth = proto->max_recursion_depth;
+    enc->compress_threshold = proto->compress_threshold;
+    if (expect_false(SRL_ENC_HAVE_OPTION(enc, SRL_F_ENABLE_FREEZE_SUPPORT))) {
+        enc->sereal_string_sv = newSVpvs("Sereal");
+    }
+    enc->protocol_version = proto->protocol_version;
+
+    DEBUG_ASSERT_BUF_SANE(&enc->buf);
     return enc;
 }
 
@@ -423,46 +609,31 @@ srl_init_string_deduper_hv(pTHX_ srl_encoder_t *enc)
     return enc->string_deduper_hv;
 }
 
-/* Lazy working buffer alloc */
-SRL_STATIC_INLINE void
-srl_init_snappy_workmem(pTHX_ srl_encoder_t *enc)
-{
-    /* Lazy working buffer alloc */
-    if (expect_false( enc->snappy_workmem == NULL )) {
-        /* Cleaned up automatically by the cleanup handler */
-        Newx(enc->snappy_workmem, CSNAPPY_WORKMEM_BYTES, char);
-        if (enc->snappy_workmem == NULL)
-            croak("Out of memory!");
-    }
-}
-
 
 void
-srl_write_header(pTHX_ srl_encoder_t *enc, SV *user_header_src)
+srl_write_header(pTHX_ srl_encoder_t *enc, SV *user_header_src, const U32 compress_flags)
 {
     /* 4th to 8th bit are flags. Using 4th for snappy flag. FIXME needs to go in spec. */
-    const U8 version_and_flags = (SRL_ENC_HAVE_OPTION(enc, SRL_F_USE_PROTO_V1) ? 1 : SRL_PROTOCOL_VERSION)
-                                 | (
-                                    SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_SNAPPY)
-                                    ? SRL_PROTOCOL_ENCODING_SNAPPY
-                                    : SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL)
-                                    ? SRL_PROTOCOL_ENCODING_SNAPPY_INCREMENTAL
-                                    : SRL_PROTOCOL_ENCODING_RAW
-                                 );
+
+    U8 flags= SRL_F_COMPRESS_FLAGS_TO_PROTOCOL_ENCODING[ compress_flags >> SRL_F_COMPRESS_FLAGS_SHIFT ];
+    const U8 version_and_flags = (U8)enc->protocol_version | flags;
 
     /* 4 byte magic string + proto version
      * + potentially uncompressed size varint
      * +  1 byte varint that indicates zero-length header */
-    BUF_SIZE_ASSERT(enc, sizeof(SRL_MAGIC_STRING) + 1 + 1);
-    srl_buf_cat_str_s_nocheck(enc, SRL_MAGIC_STRING);
-    srl_buf_cat_char_nocheck(enc, version_and_flags);
+    BUF_SIZE_ASSERT(&enc->buf, sizeof(SRL_MAGIC_STRING) + 1 + 1);
+    if (expect_true( enc->protocol_version > 2 ))
+      srl_buf_cat_str_s_nocheck(&enc->buf, SRL_MAGIC_STRING_HIGHBIT);
+    else
+      srl_buf_cat_str_s_nocheck(&enc->buf, SRL_MAGIC_STRING);
+    srl_buf_cat_char_nocheck(&enc->buf, version_and_flags);
     if (user_header_src == NULL) {
-        srl_buf_cat_char_nocheck(enc, '\0'); /* variable header length (0 right now) */
+        srl_buf_cat_char_nocheck(&enc->buf, '\0'); /* variable header length (0 right now) */
     }
     else {
         STRLEN user_data_len;
 
-        if (expect_false( SRL_ENC_HAVE_OPTION(enc, SRL_F_USE_PROTO_V1) ))
+        if (expect_false( enc->protocol_version < 2 ))
             croak("Cannot serialize user header data in Sereal protocol V1 mode!");
 
         /* Allocate tmp buffer for swapping if necessary,
@@ -472,21 +643,21 @@ srl_write_header(pTHX_ srl_encoder_t *enc, SV *user_header_src)
 
         /* Write document body (for header) into separate buffer */
         srl_buf_swap_buffer(aTHX_ &enc->tmp_buf, &enc->buf);
-        SRL_UPDATE_BODY_POS(enc);
+        SRL_ENC_UPDATE_BODY_POS(enc);
         srl_dump_sv(aTHX_ enc, user_header_src);
         srl_fixup_weakrefs(aTHX_ enc); /* more bodies to follow */
         srl_clear_seen_hashes(aTHX_ enc); /* more bodies to follow */
 
         /* Swap main buffer back in, encode header length&bitfield, copy user header data */
-        user_data_len = BUF_POS_OFS(enc->buf);
+        user_data_len = BUF_POS_OFS(&enc->buf);
         srl_buf_swap_buffer(aTHX_ &enc->buf, &enc->tmp_buf);
 
-        BUF_SIZE_ASSERT(enc, user_data_len + 1 + SRL_MAX_VARINT_LENGTH); /* +1 for bit field, +X for header len */
+        BUF_SIZE_ASSERT(&enc->buf, user_data_len + 1 + SRL_MAX_VARINT_LENGTH); /* +1 for bit field, +X for header len */
 
         /* Encode header length */
-        srl_buf_cat_varint_nocheck(aTHX_ enc, 0, (UV)(user_data_len + 1)); /* +1 for bit field */
+        srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, 0, (UV)(user_data_len + 1)); /* +1 for bit field */
         /* Encode bitfield */
-        srl_buf_cat_char_nocheck(enc, '\1');
+        srl_buf_cat_char_nocheck(&enc->buf, '\1');
         /* Copy user header data */
         Copy(enc->tmp_buf.start, enc->buf.pos, user_data_len, char);
         enc->buf.pos += user_data_len;
@@ -531,19 +702,27 @@ srl_dump_nv(pTHX_ srl_encoder_t *enc, SV *src)
     MS_VC6_WORKAROUND_VOLATILE double d= (double)nv;
     /* TODO: this logic could be reworked to not duplicate so much code, which will help on win32 */
     if ( f == nv || nv != nv ) {
-        BUF_SIZE_ASSERT(enc, 1 + sizeof(f)); /* heuristic: header + string + simple value */
-        srl_buf_cat_char_nocheck(enc,SRL_HDR_FLOAT);
+        BUF_SIZE_ASSERT(&enc->buf, 1 + sizeof(f)); /* heuristic: header + string + simple value */
+        srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_FLOAT);
         Copy((char *)&f, enc->buf.pos, sizeof(f), char);
         enc->buf.pos += sizeof(f);
     } else if (d == nv) {
-        BUF_SIZE_ASSERT(enc, 1 + sizeof(d)); /* heuristic: header + string + simple value */
-        srl_buf_cat_char_nocheck(enc,SRL_HDR_DOUBLE);
+        BUF_SIZE_ASSERT(&enc->buf, 1 + sizeof(d)); /* heuristic: header + string + simple value */
+        srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_DOUBLE);
         Copy((char *)&d, enc->buf.pos, sizeof(d), char);
         enc->buf.pos += sizeof(d);
     } else {
-        BUF_SIZE_ASSERT(enc, 1 + sizeof(nv)); /* heuristic: header + string + simple value */
-        srl_buf_cat_char_nocheck(enc,SRL_HDR_LONG_DOUBLE);
+        BUF_SIZE_ASSERT(&enc->buf, 1 + sizeof(nv)); /* heuristic: header + string + simple value */
+        srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_LONG_DOUBLE);
         Copy((char *)&nv, enc->buf.pos, sizeof(nv), char);
+#if SRL_EXTENDED_PRECISION_LONG_DOUBLE
+        /* x86 uses an 80 bit extended precision. on 64 bit machines
+         * this is 16 bytes long, and on 32 bits its is 12 bytes long.
+         * the unused 2/6 bytes are not necessarily zeroed, potentially
+         * allowing internal memory to be exposed. We therefore zero
+         * the unused bytes here. */
+        memset(enc->buf.pos+10, 0, sizeof(nv) - 10);
+#endif
         enc->buf.pos += sizeof(nv);
     }
 }
@@ -562,25 +741,25 @@ srl_dump_ivuv(pTHX_ srl_encoder_t *enc, SV *src)
     /* FIXME find a way to express the condition without repeated SvIV/SvUV */
     if (expect_true( SvIOK_UV(src) || SvIV(src) >= 0 )) {
         const UV num = SvUV(src); /* FIXME is SvUV_nomg good enough because of the GET magic in dump_sv? SvUVX after having checked the flags? */
-        if (num < 16) {
+        if (num <= 15) {
             /* encodable as POS */
             hdr = SRL_HDR_POS_LOW | (unsigned char)num;
-            srl_buf_cat_char(enc, hdr);
+            srl_buf_cat_char(&enc->buf, hdr);
         }
         else {
-            srl_buf_cat_varint(aTHX_ enc, SRL_HDR_VARINT, num);
+            srl_buf_cat_varint(aTHX_ &enc->buf, SRL_HDR_VARINT, num);
         }
     }
     else {
         const IV num = SvIV(src);
-        if (num > -17) {
+        if (num >= -16) {
             /* encodable as NEG */
             hdr = SRL_HDR_NEG_LOW | ((unsigned char)num + 32);
-            srl_buf_cat_char(enc, hdr);
+            srl_buf_cat_char(&enc->buf, hdr);
         }
         else {
             /* Needs ZIGZAG */
-            srl_buf_cat_zigzag(aTHX_ enc, SRL_HDR_ZIGZAG, num);
+            srl_buf_cat_zigzag(aTHX_ &enc->buf, SRL_HDR_ZIGZAG, num);
         }
     }
 }
@@ -607,7 +786,7 @@ srl_get_frozen_object(pTHX_ srl_encoder_t *enc, SV *src, SV *referent)
             SV *replacement= NULL;
             PTABLE_t *freezeobj_svhash = SRL_GET_FREEZEOBJ_SVHASH(enc);
             if (SvREFCNT(referent)>1) {
-                replacement= PTABLE_fetch(freezeobj_svhash, referent);
+                replacement= (SV *) PTABLE_fetch(freezeobj_svhash, referent);
             }
             if (!replacement) {
                 int count;
@@ -664,7 +843,7 @@ srl_dump_classname(pTHX_ srl_encoder_t *enc, SV *referent, SV *replacement)
 
         if (oldoffset != 0) {
             /* Issue COPY instead of literal class name string */
-            srl_buf_cat_varint(aTHX_ enc,
+            srl_buf_cat_varint(aTHX_ &enc->buf,
                                      expect_false(replacement) ? SRL_HDR_OBJECTV_FREEZE : SRL_HDR_OBJECTV,
                                      (UV)oldoffset);
         }
@@ -679,10 +858,10 @@ srl_dump_classname(pTHX_ srl_encoder_t *enc, SV *referent, SV *replacement)
              * At least, we can safely use the same PTABLE to store the ptrs to hashkeys since
              * the set of pointers will never collide.
              * /me bows to Yves for the delightfully evil hack. */
-            srl_buf_cat_char(enc, expect_false(replacement) ? SRL_HDR_OBJECT_FREEZE : SRL_HDR_OBJECT);
+            srl_buf_cat_char(&enc->buf, expect_false(replacement) ? SRL_HDR_OBJECT_FREEZE : SRL_HDR_OBJECT);
 
             /* remember current offset before advancing it */
-            PTABLE_store(string_seenhash, (void *)stash, (void *)BODY_POS_OFS(enc->buf));
+            PTABLE_store(string_seenhash, (void *)stash, INT2PTR(void *, BODY_POS_OFS(&enc->buf)));
 
             /* HvNAMEUTF8 not in older perls and it would be 0 for those anyway */
 #if PERL_VERSION >= 16
@@ -702,7 +881,9 @@ SRL_STATIC_INLINE srl_encoder_t *
 srl_prepare_encoder(pTHX_ srl_encoder_t *enc)
 {
     /* Check whether encoder is in use and create a new one on the
-     * fly if necessary. Should only happen in bizarre edge cases... hopefully. */
+     * fly if necessary. Should only happen in edge cases such as
+     * FREEZE hooks that serialize things using the same encoder
+     * object. */
     if (SRL_ENC_HAVE_OPER_FLAG(enc, SRL_OF_ENCODER_DIRTY)) {
         srl_encoder_t * const proto = enc;
         enc = srl_build_encoder_struct_alike(aTHX_ proto);
@@ -717,136 +898,77 @@ srl_prepare_encoder(pTHX_ srl_encoder_t *enc)
     return enc;
 }
 
-
-/* Update a varint anywhere in the output stream with defined start and end
- * positions. This can produce non-canonical varints and is useful for filling
- * pre-allocated varints. */
-SRL_STATIC_INLINE void
-srl_update_varint_from_to(pTHX_ char *varint_start, char *varint_end, UV number)
-{
-    while (number >= 0x80) {                      /* while we are larger than 7 bits long */
-        *varint_start++ = (number & 0x7f) | 0x80; /* write out the least significant 7 bits, set the high bit */
-        number = number >> 7;                     /* shift off the 7 least significant bits */
-    }
-    /* if it is the same size we can use a canonical varint */
-    if ( varint_start == varint_end ) {
-        *varint_start = number;                   /* encode the last 7 bits without the high bit being set */
-    } else {
-        /* if not we produce a non-canonical varint, basically we stuff
-         * 0 bits (via 0x80) into the "tail" of the varint, until we can
-         * stick in a null to terminate the sequence. This means that the
-         * varint is effectively "self-padding", and we only need special
-         * logic in the encoder - a decoder will happily process a non-canonical
-         * varint with no problem */
-        *varint_start++ = (number & 0x7f) | 0x80;
-        while ( varint_start < varint_end )
-            *varint_start++ = 0x80;
-        *varint_start= 0;
-    }
-}
-
-
-/* Resets the Snappy-compression header flag to OFF.
- * Obviously requires that a Sereal header was already written to the
- * encoder's output buffer. */
-SRL_STATIC_INLINE void
-srl_reset_snappy_header_flag(srl_encoder_t *enc)
-{
-    /* sizeof(const char *) includes a count of \0 */
-    char *flags_and_version_byte = enc->buf.start + sizeof(SRL_MAGIC_STRING) - 1;
-    /* disable snappy flag in header */
-    *flags_and_version_byte = SRL_PROTOCOL_ENCODING_RAW |
-                              (*flags_and_version_byte & SRL_PROTOCOL_VERSION_MASK);
-}
-
-void
+SRL_STATIC_INLINE srl_encoder_t *
 srl_dump_data_structure(pTHX_ srl_encoder_t *enc, SV *src, SV *user_header_src)
 {
-    enc = srl_prepare_encoder(aTHX_ enc);
+    U32 compress_flags;
 
-    if (expect_true( !SRL_ENC_HAVE_OPTION(enc, (SRL_F_COMPRESS_SNAPPY | SRL_F_COMPRESS_SNAPPY_INCREMENTAL)) )) {
-        srl_write_header(aTHX_ enc, user_header_src);
-        SRL_UPDATE_BODY_POS(enc);
-        srl_dump_sv(aTHX_ enc, src);
-        srl_fixup_weakrefs(aTHX_ enc);
-    }
-    else {
+    enc = srl_prepare_encoder(aTHX_ enc);
+    compress_flags= SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_FLAGS_MASK);
+
+    if (expect_false(compress_flags))
+    { /* Have some sort of compression */
         ptrdiff_t sereal_header_len;
         STRLEN uncompressed_body_length;
 
         /* Alas, have to write entire packet first since the header length
          * will determine offsets. */
-        srl_write_header(aTHX_ enc, user_header_src);
-        sereal_header_len = BUF_POS_OFS(enc->buf);
-        SRL_UPDATE_BODY_POS(enc);
+        srl_write_header(aTHX_ enc, user_header_src, compress_flags);
+        sereal_header_len = BUF_POS_OFS(&enc->buf);
+        SRL_ENC_UPDATE_BODY_POS(enc);
         srl_dump_sv(aTHX_ enc, src);
         srl_fixup_weakrefs(aTHX_ enc);
-        assert(BUF_POS_OFS(enc->buf) > sereal_header_len);
-        uncompressed_body_length = BUF_POS_OFS(enc->buf) - sereal_header_len;
+        assert(BUF_POS_OFS(&enc->buf) > sereal_header_len);
+        uncompressed_body_length = BUF_POS_OFS(&enc->buf) - sereal_header_len;
 
-        if (enc->snappy_threshold > 0
-            && uncompressed_body_length < (STRLEN)enc->snappy_threshold)
-        {
-            /* Don't bother with snappy compression at all if we have less than $threshold bytes of payload */
-            srl_reset_snappy_header_flag(enc);
+        if (uncompressed_body_length < (STRLEN)enc->compress_threshold) {
+            /* Don't bother with compression at all if we have less than $threshold bytes of payload */
+            srl_reset_compression_header_flag(&enc->buf);
         }
-        else { /* do snappy compression of body */
-            srl_buffer_t old_buf; /* TODO can we use the enc->tmp_buf here to avoid allocations? */
-            char *varint_start= NULL;
-            char *varint_end= NULL;
-            uint32_t dest_len;
+        else { /* Do Snappy or zlib compression of body */
+            srl_compress_body(aTHX_ &enc->buf, sereal_header_len,
+                              compress_flags, enc->compress_level,
+                              &enc->snappy_workmem);
 
-            /* Get uncompressed payload and total packet output (after compression) lengths */
-            dest_len = csnappy_max_compressed_length(uncompressed_body_length) + sereal_header_len + 1;
-
-            /* Will have to embed compressed packet length as varint if in incremental mode */
-            if ( SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL ) )
-                dest_len += SRL_MAX_VARINT_LENGTH;
-
-            srl_init_snappy_workmem(aTHX_ enc);
-
-            /* Back up old buffer and allocate new one with correct size */
-            srl_buf_copy_buffer(aTHX_ &enc->buf, &old_buf);
-            srl_buf_init_buffer(aTHX_ &enc->buf, dest_len);
-
-            /* Copy Sereal header */
-            Copy(old_buf.start, enc->buf.pos, sereal_header_len, char);
-            enc->buf.pos += sereal_header_len;
-            SRL_UPDATE_BODY_POS(enc); /* will do the right thing wrt. protocol V1 / V2 */
-
-            /* Embed compressed packet length */
-            if ( SRL_ENC_HAVE_OPTION(enc, SRL_F_COMPRESS_SNAPPY_INCREMENTAL ) ) {
-                varint_start= enc->buf.pos;
-                srl_buf_cat_varint_nocheck(aTHX_ enc, 0, dest_len);
-                varint_end= enc->buf.pos - 1;
-            }
-
-            csnappy_compress(old_buf.start + sereal_header_len, (uint32_t)uncompressed_body_length, enc->buf.pos, &dest_len,
-                             enc->snappy_workmem, CSNAPPY_WORKMEM_BYTES_POWER_OF_TWO);
-            assert(dest_len != 0);
-
-            /* If compression didn't help, swap back to old, uncompressed buffer */
-            if (dest_len >= uncompressed_body_length) {
-                /* swap in old, uncompressed buffer */
-                srl_buf_swap_buffer(aTHX_ &enc->buf, &old_buf);
-                /* disable snappy flag */
-                srl_reset_snappy_header_flag(enc);
-            }
-            else { /* go ahead with Snappy and do final fixups */
-                /* overwrite the max size varint with the real size of the compressed data */
-                if (varint_start)
-                    srl_update_varint_from_to(aTHX_ varint_start, varint_end, dest_len);
-                enc->buf.pos += dest_len;
-            }
-
-            srl_buf_free_buffer(aTHX_ &old_buf);
-            assert(enc->buf.pos <= enc->buf.end);
-        } /* end of "actually do snappy compression" */
-    } /* end of "want snappy compression?" */
+            SRL_ENC_UPDATE_BODY_POS(enc);
+            DEBUG_ASSERT_BUF_SANE(&enc->buf);
+        }
+    } /* End of "want compression?" */
+    else
+    {
+        srl_write_header(aTHX_ enc, user_header_src, compress_flags);
+        SRL_ENC_UPDATE_BODY_POS(enc);
+        srl_dump_sv(aTHX_ enc, src);
+        srl_fixup_weakrefs(aTHX_ enc);
+    }
 
     /* NOT doing a
      *   SRL_ENC_RESET_OPER_FLAG(enc, SRL_OF_ENCODER_DIRTY);
      * here because we're relying on the SAVEDESTRUCTOR_X call. */
+    return enc;
+}
+
+SV *
+srl_dump_data_structure_mortal_sv(pTHX_ srl_encoder_t *enc, SV *src, SV *user_header_src, const U32 flags)
+{
+    assert(enc);
+    enc = srl_dump_data_structure(aTHX_ enc, src, user_header_src);
+    assert(enc->buf.start && enc->buf.pos && enc->buf.pos > enc->buf.start);
+
+    if ( flags && /* for now simpler and equivalent to: flags == SRL_ENC_SV_REUSE_MAYBE */
+         (BUF_POS_OFS(&enc->buf) > 20 && BUF_SPACE(&enc->buf) < BUF_POS_OFS(&enc->buf) )
+    ){
+        /* If not wasting more than 2x memory - FIXME fungible */
+        SV *sv = sv_2mortal(newSV_type(SVt_PV));
+        SvPV_set(sv, (char *) enc->buf.start);
+        SvLEN_set(sv, BUF_SIZE(&enc->buf));
+        SvCUR_set(sv, BUF_POS_OFS(&enc->buf));
+        SvPOK_on(sv);
+        enc->buf.start = enc->buf.pos = NULL; /* no need to free these guys now */
+        return sv;
+    }
+
+    return sv_2mortal(newSVpvn((char *)enc->buf.start, (STRLEN)BUF_POS_OFS(&enc->buf)));
 }
 
 SRL_STATIC_INLINE void
@@ -863,9 +985,9 @@ srl_fixup_weakrefs(pTHX_ srl_encoder_t *enc)
     while ( NULL != (ent = PTABLE_iter_next(it)) ) {
         const ptrdiff_t offset = (ptrdiff_t)ent->value;
         if ( offset ) {
-            char *pos = enc->buf.body_pos + offset;
+            srl_buffer_char *pos = enc->buf.body_pos + offset;
             assert(*pos == SRL_HDR_WEAKEN);
-            if (DEBUGHACK) warn("setting byte at offset %lu to PAD", (long unsigned int)offset);
+            if (DEBUGHACK) warn("setting byte at offset %"UVuf" to PAD", (UV)offset);
             *pos = SRL_HDR_PAD;
         }
     }
@@ -873,41 +995,6 @@ srl_fixup_weakrefs(pTHX_ srl_encoder_t *enc)
     PTABLE_iter_free(it);
 }
 
-#ifndef MAX_CHARSET_NAME_LENGTH
-#    define MAX_CHARSET_NAME_LENGTH 2
-#endif
-
-#if PERL_VERSION == 10
-/*
-	Apparently regexes in 5.10 are "modern" but with 5.8 internals
-*/
-#    define RXf_PMf_STD_PMMOD_SHIFT 12
-#    define RX_EXTFLAGS(re)	((re)->extflags)
-#    define RX_PRECOMP(re) ((re)->precomp)
-#    define RX_PRELEN(re) ((re)->prelen)
-
-/* Maybe this is only on OS X, where SvUTF8(sv) exists but looks at flags that don't exist */
-#    define RX_UTF8(re) (RX_EXTFLAGS(re) & RXf_UTF8)
-
-#elif defined(SvRX)
-#    define MODERN_REGEXP
-     /* With commit 8d919b0a35f2b57a6bed2f8355b25b19ac5ad0c5 (perl.git) and
-      * release 5.17.6, regular expression are no longer SvPOK (IOW are no longer
-      * considered to be containing a string).
-      * This breaks some of the REGEXP detection logic in srl_dump_sv, so
-      * we need yet another CPP define. */
-#    if PERL_VERSION > 17 || (PERL_VERSION == 17 && PERL_SUBVERSION >= 6)
-#        define REGEXP_NO_LONGER_POK
-#    endif
-#else
-#    define INT_PAT_MODS "msix"
-#    define RXf_PMf_STD_PMMOD_SHIFT 12
-#    define RX_PRECOMP(re) ((re)->precomp)
-#    define RX_PRELEN(re) ((re)->prelen)
-#    define RX_UTF8(re) ((re)->reganch & ROPT_UTF8)
-#    define RX_EXTFLAGS(re) ((re)->reganch)
-#    define RXf_PMf_COMPILETIME  PMf_COMPILETIME
-#endif
 
 
 static inline void
@@ -951,7 +1038,7 @@ srl_dump_regexp(pTHX_ srl_encoder_t *enc, SV *sv)
         match_flags >>= 1;
     }
 
-    srl_buf_cat_char(enc, SRL_HDR_REGEXP);
+    srl_buf_cat_char(&enc->buf, SRL_HDR_REGEXP);
     srl_dump_pv(aTHX_ enc, RX_PRECOMP(re),RX_PRELEN(re), (RX_UTF8(re) ? SVf_UTF8 : 0));
     srl_dump_pv(aTHX_ enc, reflags, left, 0);
     return;
@@ -966,14 +1053,14 @@ srl_dump_av(pTHX_ srl_encoder_t *enc, AV *src, U32 refcount)
     n = av_len(src)+1;
 
     /* heuristic: n is virtually the min. size of any element */
-    BUF_SIZE_ASSERT(enc, 2 + SRL_MAX_VARINT_LENGTH + n);
+    BUF_SIZE_ASSERT(&enc->buf, 2 + SRL_MAX_VARINT_LENGTH + n);
 
-    if (n < 16 && refcount == 1) {
+    if (n < 16 && refcount == 1 && !SRL_ENC_HAVE_OPTION(enc,SRL_F_CANONICAL_REFS)) {
         enc->buf.pos--; /* backup over previous REFN */
-        srl_buf_cat_char_nocheck(enc, SRL_HDR_ARRAYREF + n);
+        srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_ARRAYREF + n);
     } else {
         /* header and num. elements */
-        srl_buf_cat_varint_nocheck(aTHX_ enc, SRL_HDR_ARRAY, n);
+        srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, SRL_HDR_ARRAY, n);
     }
     if (!n)
         return;
@@ -1039,15 +1126,15 @@ srl_dump_hv(pTHX_ srl_encoder_t *enc, HV *src, U32 refcount)
         n = 0;
         while ((he = hv_iternext(src))) { ++n; }
 
-        /* heuristic: n = ~min size of n values;
-             *            + 2*n = very conservative min size of n hashkeys if all COPY */
-        BUF_SIZE_ASSERT(enc, 2 + SRL_MAX_VARINT_LENGTH + 3*n);
+        /* heuristic: n     = ~min size of n values;
+         *            + 3*n = very conservative min size of n hashkeys if all COPY */
+        BUF_SIZE_ASSERT(&enc->buf, 2 + SRL_MAX_VARINT_LENGTH + 3 * n);
 
-        if (n < 16 && refcount == 1) {
+        if (n < 16 && refcount == 1 && !SRL_ENC_HAVE_OPTION(enc,SRL_F_CANONICAL_REFS)) {
             enc->buf.pos--; /* back up over the previous REFN */
-            srl_buf_cat_char_nocheck(enc, SRL_HDR_HASHREF + n);
+            srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_HASHREF + n);
         } else {
-            srl_buf_cat_varint_nocheck(aTHX_ enc, SRL_HDR_HASH, n);
+            srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, SRL_HDR_HASH, n);
         }
 
         (void)hv_iterinit(src); /* return value not reliable according to API docs */
@@ -1106,14 +1193,14 @@ srl_dump_hv(pTHX_ srl_encoder_t *enc, HV *src, U32 refcount)
         }
     } else {
         n= HvUSEDKEYS(src);
-        /* heuristic: n = ~min size of n values;
-             *            + 2*n = very conservative min size of n hashkeys if all COPY */
-        BUF_SIZE_ASSERT(enc, 2 + SRL_MAX_VARINT_LENGTH + 3*n);
-        if (n < 16 && refcount == 1) {
+        /* heuristic: n       = ~min size of n values;
+         *            + 3 * n = very conservative min size of n hashkeys if all COPY */
+        BUF_SIZE_ASSERT(&enc->buf, 2 + SRL_MAX_VARINT_LENGTH + 3 * n);
+        if (n < 16 && refcount == 1 && !SRL_ENC_HAVE_OPTION(enc,SRL_F_CANONICAL_REFS)) {
             enc->buf.pos--; /* backup over the previous REFN */
-            srl_buf_cat_char_nocheck(enc, SRL_HDR_HASHREF + n);
+            srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_HASHREF + n);
         } else {
-            srl_buf_cat_varint_nocheck(aTHX_ enc, SRL_HDR_HASH, n);
+            srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, SRL_HDR_HASH, n);
         }
         if (n) {
             HE **he_ptr= HvARRAY(src);
@@ -1170,13 +1257,13 @@ srl_dump_hk(pTHX_ srl_encoder_t *enc, HE *src, const int share_keys)
             const ptrdiff_t oldoffset = (ptrdiff_t)PTABLE_fetch(string_seenhash, str);
             if (oldoffset != 0) {
                 /* Issue COPY instead of literal hash key string */
-                srl_buf_cat_varint(aTHX_ enc, SRL_HDR_COPY, (UV)oldoffset);
+                srl_buf_cat_varint(aTHX_ &enc->buf, SRL_HDR_COPY, (UV)oldoffset);
                 return;
             }
             else {
                 /* remember current offset before advancing it */
-                const ptrdiff_t newoffset = BODY_POS_OFS(enc->buf);
-                PTABLE_store(string_seenhash, (void *)str, (void *)newoffset);
+                const ptrdiff_t newoffset = BODY_POS_OFS(&enc->buf);
+                PTABLE_store(string_seenhash, (void *)str, INT2PTR(void *, newoffset));
             }
         }
         len= HeKLEN(src);
@@ -1208,14 +1295,16 @@ srl_dump_svpv(pTHX_ srl_encoder_t *enc, SV *src)
             SV *ofs_sv= HeVAL(dupe_offset_he);
             if (SvIOK(ofs_sv)) {
                 /* emit copy or alias */
-                srl_buf_cat_varint(aTHX_ enc, out_tag, SvIV(ofs_sv));
+                if (out_tag == SRL_HDR_ALIAS)
+                    SRL_SET_TRACK_FLAG(*(enc->buf.body_pos + SvUV(ofs_sv)));
+                srl_buf_cat_varint(aTHX_ &enc->buf, out_tag, SvIV(ofs_sv));
                 return;
             } else if (SvUOK(ofs_sv)) {
-                srl_buf_cat_varint(aTHX_ enc, out_tag, SvUV(ofs_sv));
+                srl_buf_cat_varint(aTHX_ &enc->buf, out_tag, SvUV(ofs_sv));
                 return;
             } else {
                 /* start tracking this string */
-                sv_setuv(ofs_sv, (UV)BODY_POS_OFS(enc->buf));
+                sv_setuv(ofs_sv, (UV)BODY_POS_OFS(&enc->buf));
             }
         }
     }
@@ -1225,19 +1314,29 @@ srl_dump_svpv(pTHX_ srl_encoder_t *enc, SV *src)
 SRL_STATIC_INLINE void
 srl_dump_pv(pTHX_ srl_encoder_t *enc, const char* src, STRLEN src_len, int is_utf8)
 {
-    BUF_SIZE_ASSERT(enc, 1 + SRL_MAX_VARINT_LENGTH + src_len); /* overallocate a bit sometimes */
+    BUF_SIZE_ASSERT(&enc->buf, 1 + SRL_MAX_VARINT_LENGTH + src_len); /* overallocate a bit sometimes */
     if (is_utf8) {
-        srl_buf_cat_varint_nocheck(aTHX_ enc, SRL_HDR_STR_UTF8, src_len);
+        srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, SRL_HDR_STR_UTF8, src_len);
     } else if (src_len <= SRL_MASK_SHORT_BINARY_LEN) {
-        srl_buf_cat_char_nocheck(enc, SRL_HDR_SHORT_BINARY_LOW | (char)src_len);
+        srl_buf_cat_char_nocheck(&enc->buf, SRL_HDR_SHORT_BINARY_LOW | (char)src_len);
     } else {
-        srl_buf_cat_varint_nocheck(aTHX_ enc, SRL_HDR_BINARY, src_len);
+        srl_buf_cat_varint_nocheck(aTHX_ &enc->buf, SRL_HDR_BINARY, src_len);
     }
     Copy(src, enc->buf.pos, src_len, char);
     enc->buf.pos += src_len;
 }
 
-
+#ifdef HAS_HV_BACKREFS
+AV *
+srl_hv_backreferences_p_safe(pTHX_ HV *hv) {
+    if (SvOOK(hv)) {
+        struct xpvhv_aux * const iter = HvAUX(hv);
+        return iter->xhv_backreferences;
+    } else {
+        return NULL;
+    }
+}
+#endif
 
 /* Dumps generic SVs and delegates
  * to more specialized functions for RVs, etc. */
@@ -1262,8 +1361,8 @@ srl_dump_sv(pTHX_ srl_encoder_t *enc, SV *src)
     assert(src);
 
     if (expect_false( ++enc->recursion_depth == enc->max_recursion_depth )) {
-        croak("Hit maximum recursion depth (%lu), aborting serialization",
-              (unsigned long)enc->max_recursion_depth);
+        croak("Hit maximum recursion depth (%"UVuf"), aborting serialization",
+              (UV)enc->max_recursion_depth);
     }
 
 redo_dump:
@@ -1271,7 +1370,7 @@ redo_dump:
     backrefs= NULL;
     svt = SvTYPE(src);
     refcount = SvREFCNT(src);
-    DEBUG_ASSERT_BUF_SANE(enc);
+    DEBUG_ASSERT_BUF_SANE(&enc->buf);
     if ( SvMAGICAL(src) ) {
         SvGETMAGIC(src);
 #ifdef HAS_HV_BACKREFS
@@ -1280,8 +1379,8 @@ redo_dump:
             mg = mg_find(src, PERL_MAGIC_backref);
     }
 #ifdef HAS_HV_BACKREFS
-    if (svt == SVt_PVHV) {
-        backrefs= *Perl_hv_backreferences_p(aTHX_ (HV *)src);
+    if (expect_false( svt == SVt_PVHV && SvOOK(src) )) {
+        backrefs= srl_hv_backreferences_p_safe(aTHX_ (HV *)src);
         if (DEBUGHACK) warn("backreferences %p", src);
     }
 #endif
@@ -1290,14 +1389,14 @@ redo_dump:
         PTABLE_ENTRY_t *pe= PTABLE_find(weak_seenhash, src);
         if (!pe) {
             /* not seen it before */
-            if (DEBUGHACK) warn("scalar %p - is weak referent, storing %lu", src, weakref_ofs);
+            if (DEBUGHACK) warn("scalar %p - is weak referent, storing %"UVuf, src, weakref_ofs);
             /* if weakref_ofs is false we got here some way that holds a refcount on this item */
-            PTABLE_store(weak_seenhash, src, (void *)weakref_ofs);
+            PTABLE_store(weak_seenhash, src, INT2PTR(void *, weakref_ofs));
         } else {
-            if (DEBUGHACK) warn("scalar %p - is weak referent, seen before value:%lu weakref_ofs:%lu",
+            if (DEBUGHACK) warn("scalar %p - is weak referent, seen before value:%"UVuf" weakref_ofs:%"UVuf,
                     src, (UV)pe->value, (UV)weakref_ofs);
             if (pe->value)
-                pe->value= (void *)weakref_ofs;
+                pe->value= INT2PTR(void *, weakref_ofs);
         }
         refcount++;
         weakref_ofs= 0;
@@ -1306,14 +1405,20 @@ redo_dump:
     /* check if we have seen this scalar before, and track it so
      * if we see it again we recognize it */
     if ( expect_false( refcount > 1 ) ) {
+        if (src == &PL_sv_undef && enc->protocol_version >=3 ) {
+            srl_buf_cat_char(&enc->buf, SRL_HDR_CANONICAL_UNDEF);
+            --enc->recursion_depth;
+            return;
+        }
+        else
         if (src == &PL_sv_yes) {
-            srl_buf_cat_char(enc, SRL_HDR_TRUE);
+            srl_buf_cat_char(&enc->buf, SRL_HDR_TRUE);
             --enc->recursion_depth;
             return;
         }
         else
         if (src == &PL_sv_no) {
-            srl_buf_cat_char(enc, SRL_HDR_FALSE);
+            srl_buf_cat_char(&enc->buf, SRL_HDR_FALSE);
             --enc->recursion_depth;
             return;
         }
@@ -1323,25 +1428,27 @@ redo_dump:
             if (expect_false(oldoffset)) {
                 /* we have seen it before, so we do not need to bless it again */
                 if (ref_rewrite_pos) {
-                    if (DEBUGHACK) warn("ref to %p as %lu", src, (long unsigned int)oldoffset);
+                    if (DEBUGHACK) warn("ref to %p as %"UVuf, src, (UV)oldoffset);
                     enc->buf.pos= enc->buf.body_pos + ref_rewrite_pos;
-                    srl_buf_cat_varint(aTHX_ enc, SRL_HDR_REFP, (UV)oldoffset);
+                    srl_buf_cat_varint(aTHX_ &enc->buf, SRL_HDR_REFP, (UV)oldoffset);
                 } else {
-                    if (DEBUGHACK) warn("alias to %p as %lu", src, (long unsigned int)oldoffset);
-                    srl_buf_cat_varint(aTHX_ enc, SRL_HDR_ALIAS, (UV)oldoffset);
+                    if (DEBUGHACK) warn("alias to %p as %"UVuf, src, (UV)oldoffset);
+                    srl_buf_cat_varint(aTHX_ &enc->buf, SRL_HDR_ALIAS, (UV)oldoffset);
                 }
-                SRL_SET_FBIT(*(enc->buf.body_pos + oldoffset));
+                SRL_SET_TRACK_FLAG(*(enc->buf.body_pos + oldoffset));
                 --enc->recursion_depth;
                 return;
             }
-            if (DEBUGHACK) warn("storing %p as %lu", src, (long unsigned int)BODY_POS_OFS(enc->buf));
-            PTABLE_store(ref_seenhash, src, (void *)BODY_POS_OFS(enc->buf));
+            if (DEBUGHACK) warn("storing %p as %"UVuf, src, (UV)BODY_POS_OFS(&enc->buf));
+            PTABLE_store(ref_seenhash, src, INT2PTR(void *, BODY_POS_OFS(&enc->buf)));
         }
     }
+
     if (expect_false( weakref_ofs != 0 )) {
         sv_dump(src);
-        croak("Corrupted weakref? weakref_ofs=0 (this should not happen)");
+        croak("Corrupted weakref? weakref_ofs should be 0, but got %"UVuf" (this should not happen)", weakref_ofs);
     }
+
     if (replacement) {
         if (SvROK(replacement))  {
             src= SvRV(replacement);
@@ -1356,17 +1463,9 @@ redo_dump:
         /* goto redo_dump; */
         /* Probably a "proper" solution would, but there are nits there that I dont want to chase right now. */
     }
-    if (SvPOKp(src)) {
-#if defined(MODERN_REGEXP) && !defined(REGEXP_NO_LONGER_POK)
-        /* Only need to enter here if we have rather modern regexps, but they're
-         * still POK (pre 5.17.6). */
-        if (expect_false( svt == SVt_REGEXP ) ) {
-            srl_dump_regexp(aTHX_ enc, src);
-        }
-        else
-#endif
-        srl_dump_svpv(aTHX_ enc, src);
-    }
+
+    /* --------------------------------- */
+    _SRL_IF_SIMPLE_DIRECT_DUMP_SV(enc, src, svt)
     else
 #if defined(MODERN_REGEXP) && defined(REGEXP_NO_LONGER_POK)
     /* Only need to enter here if we have rather modern regexps AND they're
@@ -1376,16 +1475,6 @@ redo_dump:
     }
     else
 #endif
-    if (SvNOKp(src)) {
-        /* dump floats */
-        srl_dump_nv(aTHX_ enc, src);
-    }
-    else
-    if (SvIOKp(src)) {
-        /* dump ints */
-        srl_dump_ivuv(aTHX_ enc, src);
-    }
-    else
     if (SvROK(src)) {
         /* dump references */
         SV *referent= SvRV(src);
@@ -1398,11 +1487,11 @@ redo_dump:
 #endif
         if (expect_false( SvWEAKREF(src) )) {
             if (DEBUGHACK) warn("Is weakref %p", src);
-            weakref_ofs= BODY_POS_OFS(enc->buf);
-            srl_buf_cat_char(enc, SRL_HDR_WEAKEN);
+            weakref_ofs= BODY_POS_OFS(&enc->buf);
+            srl_buf_cat_char(&enc->buf, SRL_HDR_WEAKEN);
         }
 
-        ref_rewrite_pos= BODY_POS_OFS(enc->buf);
+        ref_rewrite_pos= BODY_POS_OFS(&enc->buf);
 
         if (expect_false( sv_isobject(src) )) {
             /* Write bless operator with class name */
@@ -1410,7 +1499,7 @@ redo_dump:
             srl_dump_classname(aTHX_ enc, referent, replacement); /* 1 == have freeze call */
         }
 
-        srl_buf_cat_char(enc, SRL_HDR_REFN);
+        srl_buf_cat_char(&enc->buf, SRL_HDR_REFN);
         refsv= src;
         src= referent;
 
@@ -1455,7 +1544,7 @@ redo_dump:
                         PTABLE_delete(ref_seenhash, src);                                      \
                         enc->buf.pos= enc->buf.body_pos + ref_rewrite_pos;                     \
                     }                                                                          \
-                    srl_buf_cat_char((enc), SRL_HDR_UNDEF);                                    \
+                    srl_buf_cat_char(&(enc)->buf, SRL_HDR_UNDEF);                              \
                 }                                                                              \
                 else if ( SRL_ENC_HAVE_OPTION((enc), SRL_F_STRINGIFY_UNKNOWN) ) {              \
                     STRLEN len;                                                                \
@@ -1494,8 +1583,10 @@ redo_dump:
             } STMT_END
             SRL_HANDLE_UNSUPPORTED_TYPE(enc, src, svt, refsv, ref_rewrite_pos);
         }
-        else {
-            srl_buf_cat_char(enc, SRL_HDR_UNDEF);
+        else if (src == &PL_sv_undef && enc->protocol_version >= 3 ) {
+            srl_buf_cat_char(&enc->buf, SRL_HDR_CANONICAL_UNDEF);
+        } else {
+            srl_buf_cat_char(&enc->buf, SRL_HDR_UNDEF);
         }
     }
     else {

@@ -5,22 +5,27 @@ use warnings;
 use Carp qw/croak/;
 use XSLoader;
 
-our $VERSION = '2.03'; # Don't forget to update the TestCompat set for testing against installed encoders!
+our $VERSION = '3.005_001'; # Don't forget to update the TestCompat set for testing against installed encoders!
+our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
 
 # not for public consumption, just for testing.
 (my $num_version = $VERSION) =~ s/_//;
-my $TestCompat = [ map sprintf("%.2f", $_/100), reverse( 200 .. int($num_version * 100) ) ]; # compat with 2.00 to ...
-sub _test_compat {return(@$TestCompat, $VERSION)}
+my $TestCompat = [ map sprintf("%.2f", $_/100), reverse( 300 .. int($num_version * 100) ) ]; # compat with 3.00 to ...
+sub _test_compat { return(@$TestCompat, $VERSION) }
 
 use Exporter 'import';
-our @EXPORT_OK = qw(decode_sereal looks_like_sereal decode_sereal_with_header_data);
+our @EXPORT_OK = qw(
+    decode_sereal looks_like_sereal decode_sereal_with_header_data
+    scalar_looks_like_sereal
+    sereal_decode_with_object sereal_decode_with_header_with_object
+);
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 # export by default if run from command line
 our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
 
 sub CLONE_SKIP { 1 }
 
-XSLoader::load('Sereal::Decoder', $VERSION);
+XSLoader::load('Sereal::Decoder', $XS_VERSION);
 
 1;
 
@@ -34,7 +39,8 @@ Sereal::Decoder - Fast, compact, powerful binary deserialization
 
 =head1 SYNOPSIS
 
-  use Sereal::Decoder qw(decode_sereal looks_like_sereal);
+  use Sereal::Decoder
+    qw(decode_sereal sereal_decode_with_object scalar_looks_like_sereal);
   
   my $decoder = Sereal::Decoder->new({...options...});
   
@@ -44,12 +50,16 @@ Sereal::Decoder - Fast, compact, powerful binary deserialization
   # or if you don't have references to the top level structure, this works, too:
   $structure = $decoder->decode($blob);
   
-  # alternatively functional interface:
+  # alternatively functional interface: (See Sereal::Performance)
+  sereal_decode_with_object($decoder, $blob, $structure);
+  $structure = sereal_decode_with_object($decoder, $blob);
+
+  # much slower functional interface with no persistent objects:
   decode_sereal($blob, {... options ...}, $structure);
   $structure = decode_sereal($blob, {... options ...});
   
   # Not a full validation, but just a quick check for a reasonable header:
-  my $is_likely_sereal = looks_like_sereal($some_string);
+  my $is_likely_sereal = scalar_looks_like_sereal($some_string);
   # or:
   $is_likely_sereal = $decoder->looks_like_sereal($some_string);
 
@@ -61,10 +71,10 @@ Its sister module L<Sereal::Encoder> implements an encoder for this format.
 The two are released separately to allow for independent and safer upgrading.
 
 The Sereal protocol versions that are compatible with this decoder implementation
-are currently protocol versions 1 and 2. As it stands, it will refuse to attempt to
+are currently protocol versions 1, 2, and 3. As it stands, it will refuse to attempt to
 decode future versions of the protocol, but if necessary there is likely
 going to be an option to decode the parts of the input that are compatible
-with version 2 of the protocol. The protocol was designed to allow for this.
+with version 3 of the protocol. The protocol was designed to allow for this.
 
 The protocol specification and many other bits of documentation
 can be found in the github repository. Right now, the specification is at
@@ -139,12 +149,60 @@ This means you can do this:
         my $data= decode_sereal($buffer,{incremental=>1});
     }
 
+=head3 alias_smallint
+
+If set to a true value then C<Sereal::Decoder> will share integers from
+-16 to 15 (encoded as either SRL_HDR_NEG and SRL_HDR_POS) as read-only
+aliases to a common SV.
+
+The result of this may be significant space savings in data structures with
+many integers in the specified range. The cost is more memory used by the
+decoder and a very modest speed penalty when deserializing.
+
+Note this option changes the structure of the dumped data. Use with caution.
+
+See also the "alias_varint_under" option.
+
+=head3 alias_varint_under
+
+If set to a true positive integer smaller than 16 then this option is
+similar to setting "alias_smallint" and causes all integers from -16 to 15
+to be shared as read-only aliases to the same SV, except that this treatment
+ALSO applies to SRL_HDR_VARINT. If set to a value larger than 16 then this
+applies to all varints varints under the value set. (In general SRL_HDR_VARINT
+is used only for integers larger than 15, and SRL_HDR_NEG and SRL_HDR_POS are
+used for -16 to -1  and 0 to 15 respectively.)
+
+In simple terms if you want to share values larger than 16 then you should use
+this option, if you want to share only values in the -16 to 15 range then you
+should use the "alias_smallint" option instead.
+
+The result of this may be significant space savings in data structures with
+many integers in the desire range. The cost is more memory used by the decoder
+and a very modest speed penalty when deserializing.
+
+Note this option changes the structure of the dumped data. Use with caution.
+
+=head3 use_undef
+
+If set to a true value then this any undef value to be deserialized as
+PL_sv_undef. This may change the structure of the data structure being
+dumped, do not enable this unless you know what you are doing.
+
+=head3 set_readonly
+
+If set to a true value then the output will be completely readonly (deeply).
+
+=head3 set_readonly_scalars
+
+If set to a true value then scalars in the output will be readonly (deeply).
+References won't be readonly.
 
 =head1 INSTANCE METHODS
 
 =head2 decode
 
-Given a byte string of Sereal data, the C<decode> call derializes that data
+Given a byte string of Sereal data, the C<decode> call deserializes that data
 structure. The result can be obtained in one of two ways: C<decode> accepts
 a second parameter, which is a scalar to write the result to, AND C<decode>
 will return the resulting data structure.
@@ -161,6 +219,44 @@ In other words,
 This is an unfortunate side-effect of perls standard copy semantics of
 assignment. Possibly one day we will have an alternative to this.
 
+=head2 decode_with_header
+
+Given a byte string of Sereal data, the C<decode_with_header> call deserializes
+that data structure as C<decode> would do, however it also decodes the optional
+user data structure that can be embedded into a Sereal document, inside the
+header  (see L<Sereal::Encoder::encode>).
+
+It accepts an optional second parameter, which is a scalar to write the body
+to, and an optional third parameter, which is a scalar to write the header to.
+
+Regardless of the number of parameters received, C<decode_with_header> returns
+an ArrayRef containing the deserialized body, and the deserialized header, in
+this order.
+
+See C<decode> for the subtle difference between the one, two and three
+parameters versions.
+
+If there is no header in a Sereal document, corresponding variable or return
+value will be set to undef.
+
+=head2 decode_only_header
+
+Given a byte string of Sereal data, the C<decode_only_header> deserializes
+only the optional user data structure that can be embedded into a Sereal
+document, inside the header (see L<Sereal::Encoder::encode>).
+
+It accepts an optional second parameter, which is a scalar
+to write the header to.
+
+Regardless of the number of parameters received, C<decode_only_header> returns
+the resulting data structure.
+
+See C<decode> for the subtle difference between the one and two parameters
+versions.
+
+If there is no header in a Sereal document, corresponding variable or return
+value will be set to undef.
+
 =head2 decode_with_offset
 
 Same as the C<decode> method, except as second parameter, you must
@@ -168,14 +264,28 @@ pass an integer offset into the input string, at which the decoding is
 to start. The optional "pass-in" style scalar (see C<decode> above)
 is relegated to being the third parameter.
 
+=head2 decode_only_header_with_offset
+
+Same as the C<decode_only_header> method, except as second parameter, you must
+pass an integer offset into the input string, at which the decoding is
+to start. The optional "pass-in" style scalar (see C<decode_only_header> above)
+is relegated to being the third parameter.
+
+=head2 decode_with_header_and_offset
+
+Same as the C<decode_with_header> method, except as second parameter, you must
+pass an integer offset into the input string, at which the decoding is
+to start. The optional "pass-in" style scalars (see C<decode_with_header> above)
+are relegated to being the third and fourth parameters.
+
 =head2 bytes_consumed
 
-After using the C<decode> method, C<bytes_consumed> can return the
-number of bytes of the input string that were actually consumed by
-the decoder. That is, if you append random garbage to a valid
-Sereal document, C<decode> will happily decode the data and ignore the
-garbage. If that is an error in your use case, you can use C<bytes_consumed>
-to catch it.
+After using the various C<decode> methods documented previously,
+C<bytes_consumed> can return the number of bytes B<from the body> of the input
+string that were actually consumed by the decoder. That is, if you append
+random garbage to a valid Sereal document, C<decode> will happily decode the
+data and ignore the garbage. If that is an error in your use case, you can use
+C<bytes_consumed> to catch it.
 
   my $out = $decoder->decode($sereal_string);
   if (length($sereal_string) != $decoder->bytes_consumed) {
@@ -199,16 +309,75 @@ is concatenated into the same string (code not very robust...):
     }
   };
 
+As mentioned, only the bytes consumed from the body are considered. So the
+following example is correct, as only the header is deserialized:
+
+  my $header = $decoder->decode_only_header($sereal_string);
+  my $count = $decoder->bytes_consumed;
+  # $count is 0
+
 =head2 looks_like_sereal
 
-Given a string (or undef), checks whether it looks like it starts
-with a valid Sereal packet. This is not a full-blown validation.
-Instead, this just checks the magic string and some header properties
-to provide a quick and efficient way to distinguish multiple well-formed
-serialization methods instead of really making sure it's valid Sereal.
-For reference, sereal's magic string is a four byte string C<=srl>.
+Performs some rudimentary check to determine if the argument
+appears to be a valid Sereal packet or not. These tests are not
+comprehensive and a true result does not mean that the document
+is valid, merely that it appears to be valid. On the other hand
+a false result is always reliable.
+
+The return of this function may be treated as a simple boolean but
+is in fact a more complex return. When the argument does not
+look anything like a Sereal document then the return is perl's FALSE,
+which has the property of being string equivalent to "" and
+numerically equivalent to 0. However when the argument appears to
+be a UTF-8 encoded protocol 3 Sereal document (by noticing that
+the \xF3 in the magic string has been replaced by \xC3\xB3) then
+it returns 0 (the number, which is string equivalent to "0"), and
+otherwise returns the protocol version of the document. This means
+you can write something like this:
+
+    $type= looks_like_sereal($thing);
+    if ($type eq '') {
+        say "Not a Sereal document";
+    } elsif ($type eq '0') {
+        say "Possibly utf8 encoded Sereal document";
+    } else {
+        say "Sereal document version $type";
+    }
+
+For reference, Sereal's magic value is a four byte string which is
+either C<=srl> for protocol version 1 and 2 or C<=\xF3rl> for protocol
+version 3 and later. This function checks that the magic string
+corresponds with the reported version number, as well as other
+checks, which may be enhanced in the future.
 
 =head1 EXPORTABLE FUNCTIONS
+
+=head2 sereal_decode_with_object
+
+The functional interface that is equivalent to using C<decode>. Takes a
+decoder object reference as first parameter, followed by a byte string
+to deserialize.  Optionally takes a third parameter, which is the output
+scalar to write to. See the documentation for C<decode> above for details.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
+
+=head2 sereal_decode_with_header_with_object
+
+The functional interface that is equivalent to using C<decode_with_header>.
+Takes a decoder object reference as first parameter, followed by a byte string
+to deserialize. Optionally takes third and fourth parameters, which are
+the output scalars to write to. See the documentation for C<decode_with_header>
+above for details.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
 
 =head2 decode_sereal
 
@@ -218,12 +387,23 @@ by a hash reference of options (see documentation for C<new()>). Finally,
 C<decode_sereal> supports a third parameter, which is the output scalar
 to write to. See the documentation for C<decode> above for details.
 
-The functional interface is marginally slower than the OO interface since
+This functional interface is significantly slower than the OO interface since
 it cannot reuse the decoder object.
 
-=head2 looks_like_sereal
+=head2 decode_sereal_with_header_data
 
-Same as the object method of the same name.
+The functional interface that is equivalent to using C<new> and C<decode_with_header>.
+Expects a byte string to deserialize as first argument, optionally followed
+by a hash reference of options (see documentation for C<new()>). Finally,
+C<decode_sereal> supports third and fourth parameters, which are the output scalars
+to write to. See the documentation for C<decode_with_header> above for details.
+
+This functional interface is significantly slower than the OO interface since
+it cannot reuse the decoder object.
+
+=head2 scalar_looks_like_sereal
+
+The functional interface that is equivalent to using C<looks_like_sereal>.
 
 =head1 ROBUSTNESS
 
@@ -232,7 +412,7 @@ input data as reasonably possible. This means that it should never
 (though read on) segfault. It may, however, cause a large malloc
 to fail. Generally speaking, invalid data should cause a Perl-trappable
 exception. The one exception is that for Snappy-compressed Sereal documents,
-the Snappy library may cause segmentation faults (invalid reads orwrites).
+the Snappy library may cause segmentation faults (invalid reads or writes).
 This should only be a problem if you do not checksum your data (internal
 checksum support is a To-Do) or if you accept data from potentially
 malicious sources.
@@ -263,11 +443,9 @@ the C<FREEZE/THAW> mechanism, please refer to L<Sereal::Encoder>.
 
 =head1 PERFORMANCE
 
-The exact performance in time and space depends heavily on the data structure
-to be serialized. For ready-made comparison scripts, see the
-F<author_tools/bench.pl> and F<author_tools/dbench.pl> programs that are part
-of this distribution. Suffice to say that this library is easily competitive
-in both time and space efficiency with the best alternatives.
+Please refer to the L<Sereal::Performance> document
+that has more detailed information about Sereal performance and
+tuning thereof.
 
 =head1 THREAD-SAFETY
 
@@ -290,7 +468,7 @@ L<https://groups.google.com/forum/?fromgroups#!forum/sereal-announce>
 Sereal development list:
 L<https://groups.google.com/forum/?fromgroups#!forum/sereal-dev>
 
-=head1 AUTHORS
+=head1 AUTHORS AND CONTRIBUTORS
 
 Yves Orton E<lt>demerphq@gmail.comE<gt>
 
@@ -302,7 +480,17 @@ Rafaël Garcia-Suarez
 
 Ævar Arnfjörð Bjarmason E<lt>avar@cpan.orgE<gt>
 
+Tim Bunce
+
 Daniel Dragan E<lt>bulkdd@cpan.orgE<gt> (Windows support and bugfixes)
+
+Zefram
+
+Borislav Nikolov
+
+Ivan Kruglov E<lt>ivan.kruglov@yahoo.comE<gt>
+
+Eric Herman E<lt>eric@freesa.orgE<gt>
 
 Some inspiration and code was taken from Marc Lehmann's
 excellent JSON::XS module due to obvious overlap in

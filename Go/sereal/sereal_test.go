@@ -82,7 +82,7 @@ func TestRoundtripCompat(t *testing.T) {
 
 	input := []interface{}{map[string]interface{}{"foo": []interface{}{1, 2, 3}}}
 	expectGo := []interface{}{map[string]interface{}{"foo": []interface{}{1, 2, 3}}}
-	expectPerlCompat := []interface{}{&map[string]interface{}{"foo": &[]interface{}{1, 2, 3}}}
+	expectPerlCompat := &[]interface{}{&map[string]interface{}{"foo": &[]interface{}{1, 2, 3}}}
 
 	e := &Encoder{}
 	d := &Decoder{}
@@ -234,8 +234,8 @@ func TestSnappyArray(t *testing.T) {
 		return
 	}
 
-	e.UseSnappy = true
-	e.SnappyThreshold = 0 // always compress
+	e.Compression = SnappyCompressor{Incremental: true}
+	e.CompressionThreshold = 0 // always compress
 	snencoded, err := e.Marshal(manydups)
 
 	if err != nil {
@@ -421,6 +421,62 @@ func TestStructs(t *testing.T) {
 	}
 }
 
+func TestDecodeToStruct(t *testing.T) {
+	type obj struct {
+		ValueStr   string
+		ValueByte  []byte
+		ValueInt   int
+		ValueSlice []float32
+		ValueHash  map[string][]byte
+	}
+
+	exp := make([]obj, 3)
+	exp[0] = obj{
+		ValueStr:   "string as string value which actually should be 32+ characters",
+		ValueByte:  []byte("string as binary value"),
+		ValueInt:   10,
+		ValueSlice: []float32{1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0},
+		ValueHash: map[string][]byte{
+			"key1": []byte("unique value"),
+			"key2": []byte("duplicate value"),
+			"key3": []byte("deplicate value"),
+		},
+	}
+
+	exp[1] = obj{
+		ValueStr:   "another string as string value which actually should be 32+ characters",
+		ValueByte:  []byte("another string as binary value"),
+		ValueInt:   -10,
+		ValueSlice: []float32{18.0, 19.0, 20.0},
+		ValueHash: map[string][]byte{
+			"key1": []byte("unique value"),
+			"key2": []byte("duplicate value"),
+			"key3": []byte("deplicate value"),
+		},
+	}
+
+	exp[2] = exp[0]
+
+	filename := "test_dir/test-decode-struct.srl"
+	content, err := ioutil.ReadFile(filename)
+
+	if err != nil {
+		t.Skip("run 'make test_files' and try again")
+		return
+	}
+
+	var slice []obj
+	d := NewDecoder()
+
+	if err := d.Unmarshal(content, &slice); err != nil {
+		t.Errorf("error unmarshalling: %s", err)
+	}
+
+	if !reflect.DeepEqual(exp, slice) {
+		t.Errorf("failed decode into struct:\n\nexp: %#v:\n\ngot %#v\n", exp, slice)
+	}
+}
+
 type ErrorBinaryUnmarshaler int
 
 var errUnmarshaler = errors.New("error binary unmarshaler")
@@ -496,7 +552,7 @@ func TestBinaryMarshaller(t *testing.T) {
 
 	// check that registering a type works
 	var registerTime time.Time
-	RegisterName("time.Time", &registerTime)
+	d.RegisterName("time.Time", &registerTime)
 
 	// unpack into a nil interface should return a time.Time
 	var tintf interface{}
@@ -515,11 +571,56 @@ func TestBinaryMarshaller(t *testing.T) {
 	}
 
 	// overwrite with our error type
-	RegisterName("time.Time", &errunmarshaler)
+	d.RegisterName("time.Time", &errunmarshaler)
 	var eintf interface{}
 
 	err = d.Unmarshal(x, &eintf)
 	if err != errUnmarshaler {
 		t.Errorf("failed to error unpacking registered error type: %s", err)
+	}
+}
+
+func TestUnmarshalHeaderError(t *testing.T) {
+
+	testcases := []struct {
+		docHex string
+		err    error
+	}{
+		// Garbage
+		{"badbadbadbad", ErrBadHeader},
+		// Version 1 and 2, "=srl"
+		{"3d73726c0100", nil},
+		{"3d73726c0200", nil},
+		// Version 3, "=srl" with a high-bit-set-on-the-"s"
+		{"3df3726c0300", nil},
+		// Version 3, "=srl" corrupted by accidental UTF8 encoding
+		{"3dc3b3726c0300", ErrBadHeaderUTF8},
+		// Forbidden version 2 and high-bit-set-on-the-"s" combination
+		{"3df3726c0200", ErrBadHeader},
+		// Forbidden version 3 and obsolete "=srl" magic string
+		{"3d73726c0300", ErrBadHeader},
+		// Non-existing (yet) version 4, "=srl" with a high-bit-set-on-the-"s"
+		{"3df3726c0400", errors.New("document version '4' not yet supported")},
+	}
+
+	d := NewDecoder()
+
+	for i, tc := range testcases {
+		doc, err := hex.DecodeString(tc.docHex)
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+
+		got := d.UnmarshalHeaderBody(doc, nil, nil)
+		wanted := tc.err
+
+		ok := false
+		ok = ok || (got == nil && wanted == nil)
+		ok = ok || (got != nil && wanted != nil && got.Error() == wanted.Error())
+		if !ok {
+			t.Errorf("test case #%v:\ngot   : %v\nwanted: %v", i, got, wanted)
+			continue
+		}
 	}
 }

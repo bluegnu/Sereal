@@ -5,7 +5,7 @@ use warnings;
 use Carp qw/croak/;
 use XSLoader;
 
-our $VERSION = '3.005_001'; # Don't forget to update the TestCompat set for testing against installed encoders!
+our $VERSION = '3.015'; # Don't forget to update the TestCompat set for testing against installed encoders!
 our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
 
 # not for public consumption, just for testing.
@@ -18,14 +18,136 @@ our @EXPORT_OK = qw(
     decode_sereal looks_like_sereal decode_sereal_with_header_data
     scalar_looks_like_sereal
     sereal_decode_with_object sereal_decode_with_header_with_object
+    sereal_decode_only_header_with_object
+    sereal_decode_only_header_with_offset_with_object
+    sereal_decode_with_header_and_offset_with_object
+    sereal_decode_with_offset_with_object
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 # export by default if run from command line
 our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
 
 sub CLONE_SKIP { 1 }
-
 XSLoader::load('Sereal::Decoder', $XS_VERSION);
+use constant #begin generated
+{
+  'SRL_F_DECODER_ALIAS_CHECK_FLAGS' => 28672,
+  'SRL_F_DECODER_ALIAS_SMALLINT' => 4096,
+  'SRL_F_DECODER_ALIAS_VARINT' => 8192,
+  'SRL_F_DECODER_DECOMPRESS_SNAPPY' => 8,
+  'SRL_F_DECODER_DECOMPRESS_ZLIB' => 16,
+  'SRL_F_DECODER_DESTRUCTIVE_INCREMENTAL' => 1024,
+  'SRL_F_DECODER_DIRTY' => 2,
+  'SRL_F_DECODER_NEEDS_FINALIZE' => 4,
+  'SRL_F_DECODER_NO_BLESS_OBJECTS' => 512,
+  'SRL_F_DECODER_PROTOCOL_V1' => 2048,
+  'SRL_F_DECODER_READONLY_FLAGS' => 98304,
+  'SRL_F_DECODER_REFUSE_OBJECTS' => 128,
+  'SRL_F_DECODER_REFUSE_SNAPPY' => 32,
+  'SRL_F_DECODER_REFUSE_ZLIB' => 64,
+  'SRL_F_DECODER_REUSE' => 1,
+  'SRL_F_DECODER_SET_READONLY' => 32768,
+  'SRL_F_DECODER_SET_READONLY_SCALARS' => 65536,
+  'SRL_F_DECODER_USE_UNDEF' => 16384,
+  'SRL_F_DECODER_VALIDATE_UTF8' => 256,
+  'SRL_F_DECODER_VOLATILE_FLAGS' => 2078,
+  '_FLAG_NAME' => [
+                    'REUSE',
+                    'DIRTY',
+                    'NEEDS_FINALIZE',
+                    'DECOMPRESS_SNAPPY',
+                    'DECOMPRESS_ZLIB',
+                    'REFUSE_SNAPPY',
+                    'REFUSE_ZLIB',
+                    'REFUSE_OBJECTS',
+                    'VALIDATE_UTF8',
+                    'NO_BLESS_OBJECTS',
+                    'DESTRUCTIVE_INCREMENTAL',
+                    'PROTOCOL_V1',
+                    'ALIAS_SMALLINT',
+                    'ALIAS_VARINT',
+                    'USE_UNDEF',
+                    'SET_READONLY',
+                    'SET_READONLY_SCALARS'
+                  ],
+  '_FLAG_NAME_STATIC' => [
+                                'REUSE',
+                                undef,
+                                undef,
+                                undef,
+                                undef,
+                                'REFUSE_SNAPPY',
+                                'REFUSE_ZLIB',
+                                'REFUSE_OBJECTS',
+                                'VALIDATE_UTF8',
+                                'NO_BLESS_OBJECTS',
+                                'DESTRUCTIVE_INCREMENTAL',
+                                undef,
+                                'ALIAS_SMALLINT',
+                                'ALIAS_VARINT',
+                                'USE_UNDEF',
+                                'SET_READONLY',
+                                'SET_READONLY_SCALARS'
+                              ],
+  '_FLAG_NAME_VOLATILE' => [
+                             undef,
+                             'DIRTY',
+                             'NEEDS_FINALIZE',
+                             'DECOMPRESS_SNAPPY',
+                             'DECOMPRESS_ZLIB',
+                             undef,
+                             undef,
+                             undef,
+                             undef,
+                             undef,
+                             undef,
+                             'PROTOCOL_V1',
+                             undef,
+                             undef,
+                             undef,
+                             undef,
+                             undef
+                           ]
+}; #end generated
+
+sub decode_from_file {
+    my ($self, $file, )= @_; # pos 3 is "target var" if one is provided
+    open my $fh, "<", $file
+        or die "Failed to open '$file' for read: $!";
+    my $buf= do{ local $/; <$fh> };
+    close $fh
+        or die "Failed to close '$file': $!";
+    if (wantarray && ($self->flags & SRL_F_DECODER_DESTRUCTIVE_INCREMENTAL)) {
+        my @ret;
+        while (length $buf) {
+            push @ret, $self->decode($buf);
+        }
+        return @ret;
+    }
+    return $self->decode($file, $_[2]);
+}
+
+my $flags= sub {
+    my ($int, $ary)= @_;
+    return map {
+        ($ary->[$_] and $int & (1 << $_)) ? $ary->[$_] : ()
+    } (0..$#$ary);
+};
+
+sub flag_names {
+    my ($self, $val)= @_;
+    return $flags->(defined $val ? $val : $self->flags, _FLAG_NAME);
+}
+
+sub flag_names_volatile {
+    my ($self, $val)= @_;
+    return $flags->($val // $self->flags, _FLAG_NAME_VOLATILE);
+}
+
+sub flag_names_static {
+    my ($self, $val)= @_;
+    return $flags->($val // $self->flags, _FLAG_NAME_STATIC);
+}
 
 1;
 
@@ -41,15 +163,15 @@ Sereal::Decoder - Fast, compact, powerful binary deserialization
 
   use Sereal::Decoder
     qw(decode_sereal sereal_decode_with_object scalar_looks_like_sereal);
-  
+
   my $decoder = Sereal::Decoder->new({...options...});
-  
+
   my $structure;
   $decoder->decode($blob, $structure); # deserializes into $structure
-  
+
   # or if you don't have references to the top level structure, this works, too:
   $structure = $decoder->decode($blob);
-  
+
   # alternatively functional interface: (See Sereal::Performance)
   sereal_decode_with_object($decoder, $blob, $structure);
   $structure = sereal_decode_with_object($decoder, $blob);
@@ -57,7 +179,7 @@ Sereal::Decoder - Fast, compact, powerful binary deserialization
   # much slower functional interface with no persistent objects:
   decode_sereal($blob, {... options ...}, $structure);
   $structure = decode_sereal($blob, {... options ...});
-  
+
   # Not a full validation, but just a quick check for a reasonable header:
   my $is_likely_sereal = scalar_looks_like_sereal($some_string);
   # or:
@@ -103,7 +225,7 @@ desirable for robustness. See the section C<ROBUSTNESS> below.
 =head3 refuse_objects
 
 If set, the decoder will refuse deserializing any objects in the input stream and
-instead throw and exception. Defaults to off. See the section C<ROBUSTNESS> below.
+instead throw an exception. Defaults to off. See the section C<ROBUSTNESS> below.
 
 =head3 no_bless_objects
 
@@ -372,6 +494,62 @@ Takes a decoder object reference as first parameter, followed by a byte string
 to deserialize. Optionally takes third and fourth parameters, which are
 the output scalars to write to. See the documentation for C<decode_with_header>
 above for details.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
+
+=head2 sereal_decode_only_header_with_object
+
+The functional interface that is equivalent to using C<decode_only_header>.
+Takes a decoder object reference as first parameter, followed by a byte string
+to deserialize. Optionally takes a third parameters, which outputs scalars to write to.
+See the documentation for C<decode_with_header> above for details.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
+
+=head2 sereal_decode_only_header_with_offset_with_object
+
+The functional interface that is equivalent to using C<decode_only_header_with_offset>.
+Same as the C<sereal_decode_only_header_with_object> function,
+except as the third parameter, you must
+pass an integer offset into the input string, at which the decoding is
+to start. The optional "pass-in" style scalar (see C<sereal_decode_only_header_with_object> above)
+is relegated to being the fourth parameter.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
+
+=head2 sereal_decode_with_header_and_offset_with_object
+
+The functional interface that is equivalent to using C<decode_with_header_and_offset>.
+Same as the C<sereal_decode_with_header_with_object> function, except as the third parameter, you must
+pass an integer offset into the input string, at which the decoding is
+to start. The optional "pass-in" style scalars (see C<sereal_decode_with_header_with_object> above)
+are relegated to being the fourth and fifth parameters.
+
+This functional interface is marginally faster than the OO interface
+since it avoids method resolution overhead and, on sufficiently modern
+Perl versions, can usually avoid subroutine call overhead. See
+L<Sereal::Performance> for a discussion on how to tune Sereal for maximum
+performance if you need to.
+
+=head2 sereal_decode_with_offset_with_object
+
+The functional interface that is equivalent to using C<decode_with_offset>.
+Same as the C<sereal_decode_with_object> function, except as the third parameter, you must
+pass an integer offset into the input string, at which the decoding is
+to start. The optional "pass-in" style scalar (see C<sereal_decode_with_object> above)
+is relegated to being the third parameter.
 
 This functional interface is marginally faster than the OO interface
 since it avoids method resolution overhead and, on sufficiently modern

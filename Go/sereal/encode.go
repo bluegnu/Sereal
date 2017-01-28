@@ -128,7 +128,9 @@ func (e *Encoder) MarshalWithHeader(header interface{}, body interface{}) (b []b
 	case 2, 3:
 		encBody = append(encBody, 0) // hack for 1-based offsets
 		encBody, err = e.encode(encBody, body, false, false, strTable, ptrTable)
-		encBody = encBody[1:] // trim hacky first byte
+		if len(encBody) >= 1 {
+			encBody = encBody[1:] // trim hacky first byte
+		}
 	}
 
 	if err != nil {
@@ -200,7 +202,7 @@ func (e *Encoder) encode(b []byte, v interface{}, isKeyOrClass bool, isRefNext b
 	case int32:
 		b = e.encodeInt(b, reflect.Int, int64(value))
 	case int64:
-		b = e.encodeInt(b, reflect.Int, int64(value))
+		b = e.encodeInt(b, reflect.Int, value)
 
 	case uint:
 		b = e.encodeInt(b, reflect.Uint, int64(value))
@@ -298,7 +300,7 @@ func (e *Encoder) encodeInt(by []byte, k reflect.Kind, i int64) []byte {
 			by = append(by, typeVARINT)
 		}
 
-		by = varint(by, uint(n))
+		by = varint(by, n)
 	}
 
 	return by
@@ -410,7 +412,7 @@ func (e *Encoder) encodeStrMap(by []byte, m map[string]interface{}, isRefNext bo
  * Encode via reflection
  *************************************/
 func (e *Encoder) encodeViaReflection(b []byte, rv reflect.Value, isKeyOrClass bool, isRefNext bool, strTable map[string]int, ptrTable map[uintptr]int) ([]byte, error) {
-	if !e.DisableFREEZE && rv.Kind() != reflect.Invalid {
+	if !e.DisableFREEZE && rv.Kind() != reflect.Invalid && rv.Kind() != reflect.Ptr {
 		if m, ok := rv.Interface().(encoding.BinaryMarshaler); ok {
 			by, err := m.MarshalBinary()
 			if err != nil {
@@ -448,6 +450,26 @@ func (e *Encoder) encodeViaReflection(b []byte, rv reflect.Value, isKeyOrClass b
 
 	case reflect.Ptr:
 		b, err = e.encodePointer(b, rv, strTable, ptrTable)
+
+	case reflect.Bool:
+		if rv.Bool() {
+			b = append(b, typeTRUE)
+		} else {
+			b = append(b, typeFALSE)
+		}
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		b = e.encodeInt(b, rk, rv.Int())
+
+	case reflect.Float32:
+		b = e.encodeFloat(b, float32(rv.Float()))
+
+	case reflect.Float64:
+		b = e.encodeDouble(b, rv.Float())
+
+	case reflect.String:
+		b = e.encodeString(b, rv.String(), isKeyOrClass, strTable)
 
 	default:
 		panic(fmt.Sprintf("no support for type '%s' (%s)", rk.String(), rv.Type()))
@@ -571,7 +593,9 @@ func (e *Encoder) encodePointer(by []byte, rv reflect.Value, strTable map[string
 
 		by = append(by, typeREFN)
 
-		ptrTable[rvptr] = lenbOrig
+		if rvptr != 0 {
+			ptrTable[rvptr] = lenbOrig
+		}
 
 		var err error
 		by, err = e.encode(by, rv.Elem(), false, true, strTable, ptrTable)

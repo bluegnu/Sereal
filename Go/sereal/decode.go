@@ -478,15 +478,14 @@ func (d *Decoder) decodeHash(by []byte, idx int, ln int, ptr *interface{}, isRef
 	}
 
 	var err error
-	var key []byte
-	var value interface{}
-
 	for i := 0; i < ln; i++ {
+		var key []byte
 		key, idx, err = d.decodeStringish(by, idx)
 		if err != nil {
 			return 0, err
 		}
 
+		var value interface{}
 		idx, err = d.decode(by, idx, &value)
 		if err != nil {
 			return 0, err
@@ -715,7 +714,7 @@ func (d *Decoder) decodeViaReflection(by []byte, idx int, ptr reflect.Value) (in
 		if val, idx, err = d.decodeDouble(by, idx); err != nil {
 			return 0, err
 		}
-		ptr.SetFloat(float64(val))
+		ptr.SetFloat(val)
 
 	case tag == typeTRUE, tag == typeFALSE:
 		ptr.SetBool(tag == typeTRUE)
@@ -916,13 +915,13 @@ func (d *Decoder) decodeHashViaReflection(by []byte, idx int, ln int, ptr reflec
 				idx, err = d.decodeViaReflection(by, idx, value)
 			} else {
 				// there is no strkey in map, crete a new one
-				var iface interface{}
-				idx, err = d.decode(by, idx, &iface)
+				riface := reflect.New(ptr.Type().Elem())
+				idx, err = d.decodeViaReflection(by, idx, riface.Elem())
 				if err != nil {
 					return 0, err
 				}
 
-				ptr.SetMapIndex(keyValue, reflect.ValueOf(iface))
+				ptr.SetMapIndex(keyValue, riface.Elem())
 			}
 
 			if err != nil {
@@ -930,6 +929,13 @@ func (d *Decoder) decodeHashViaReflection(by []byte, idx int, ln int, ptr reflec
 			}
 		}
 
+	case reflect.Ptr:
+		if ptr.IsNil() {
+			n := reflect.New(ptr.Type().Elem())
+			ptr.Set(n)
+		}
+
+		return d.decodeHashViaReflection(by, idx, ln, ptr.Elem())
 	case reflect.Struct:
 		tags := d.tcache.Get(ptr)
 		var err error
@@ -986,7 +992,13 @@ func (d *Decoder) decodeREFP_ALIAS(by []byte, idx int, isREFP bool) (reflect.Val
 	rv, ok := d.tracked[offs]
 	if !ok {
 		var res reflect.Value
-		return res, 0, ErrCorrupt{errUntrackedOffsetREFP}
+		var corrupt ErrCorrupt
+		if isREFP {
+			corrupt.Err = errUntrackedOffsetREFP
+		} else {
+			corrupt.Err = errUntrackedOffsetAlias
+		}
+		return res, 0, corrupt
 	}
 
 	var res reflect.Value
@@ -1022,7 +1034,8 @@ func (d *Decoder) decodeObjectViaReflection(by []byte, idx int, ptr reflect.Valu
 		className, idx, err = d.decodeStringish(by, idx)
 	} else {
 		// typeOBJECTV
-		offs, sz, err := varintdecode(by[idx:])
+		var offs, sz int
+		offs, sz, err = varintdecode(by[idx:])
 		if err != nil {
 			return 0, err
 		}
@@ -1200,6 +1213,11 @@ func varintdecode(by []byte) (n int, sz int, err error) {
 }
 
 func findUnmarshaler(ptr reflect.Value) (encoding.BinaryUnmarshaler, bool) {
+	if ptr.Kind() == reflect.Ptr && ptr.IsNil() {
+		p := reflect.New(ptr.Type().Elem())
+		ptr.Set(p)
+	}
+
 	if obj, ok := ptr.Interface().(encoding.BinaryUnmarshaler); ok {
 		return obj, true
 	}

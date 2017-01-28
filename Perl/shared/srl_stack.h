@@ -20,6 +20,8 @@
     assert((stack)->begin <= (stack)->end);                                   \
     assert((stack)->ptr == NULL ||                                            \
            ((stack)->ptr >= (stack)->begin && (stack)->ptr <= (stack)->end)); \
+    assert(((stack)->ptr == NULL && (stack)->depth == -1) ||                  \
+           ((stack)->ptr - (stack)->begin) == (stack)->depth);                \
 } STMT_END
 
 #ifdef TRACE_STACK
@@ -31,11 +33,14 @@
 
 #define SRL_STACK_SIZE(stack)  (((stack)->end - (stack)->begin) + 1)
 #define SRL_STACK_SPACE(stack) (((stack)->ptr - (stack)->begin) + 1)
-#define SRL_STACK_DEPTH(stack) ((stack)->ptr ? (stack)->ptr - (stack)->begin : -1)
+#define SRL_STACK_DEPTH(stack) ((stack)->depth)
 
 typedef struct srl_stack srl_stack_t;
+typedef struct srl_stack * srl_stack_ptr;
+
 struct srl_stack {
-    srl_stack_type_t *begin, *end, *ptr;
+    IV depth; // benchmarking showed that calculating depth takes up to 5%, so we store it
+    srl_stack_type_t *ptr, *begin, *end;
 };
 
 /* Allocate new arrfer (but not the stack struct */
@@ -52,6 +57,7 @@ srl_stack_init(pTHX_ srl_stack_t * stack, size_t size)
 
     stack->end = stack->begin + size - 1;
     stack->ptr = NULL;
+    stack->depth = -1;
 
     assert(SRL_STACK_SIZE(stack) == (int) size);
     return 0;
@@ -84,19 +90,49 @@ srl_stack_destroy(pTHX_ srl_stack_t *stack)
     Safefree(stack->begin);
 }
 
+SRL_STATIC_INLINE int
+srl_stack_copy(pTHX_ srl_stack_t *from, srl_stack_t *to)
+{
+    size_t size;
+    assert(from != NULL);
+    assert(to != NULL);
+
+    to->begin = NULL;
+    size = SRL_STACK_SIZE(from);
+
+    Newx(to->begin, size, srl_stack_type_t);
+    if (expect_false(to->begin == NULL))
+        return 1;
+
+    if (from->ptr == NULL) {
+        to->ptr = NULL;
+    } else {
+        Copy(from->begin, to->begin, SRL_STACK_SPACE(from), srl_stack_type_t);
+        to->ptr = to->begin + from->depth;
+    }
+
+    to->end = to->begin + size - 1;
+    to->depth = from->depth;
+
+    DEBUG_ASSERT_STACK_SANE(to);
+    assert(SRL_STACK_SIZE(to) == (int) size);
+    return 0;
+}
+
 #define srl_stack_clear(stack) STMT_START {                           \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
     (stack)->ptr = NULL;                                              \
+    (stack)->depth = -1;                                              \
 } STMT_END
 
 #define srl_stack_ptr(stack)   ((stack)->ptr)
 #define srl_stack_empty(stack) ((stack)->ptr == NULL)
-#define srl_stack_full(stack)  ((stack)->ptr == (stack)->end)
+#define srl_stack_full(stack)  ((stack)->ptr >= (stack)->end)
 
 #define srl_stack_push_ptr(stack, val_ptr) STMT_START {               \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
                                                                       \
-    if (srl_stack_empty(stack)) {                                     \
+    if (expect_false(srl_stack_empty(stack))) {                       \
         (stack)->ptr = (stack)->begin;                                \
         (val_ptr) = (stack)->begin;                                   \
     } else {                                                          \
@@ -106,15 +142,17 @@ srl_stack_destroy(pTHX_ srl_stack_t *stack)
         (val_ptr) = ++(stack)->ptr;                                   \
     }                                                                 \
                                                                       \
+    (stack)->depth++;                                                 \
+                                                                      \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
-    SRL_STACK_TRACE("pushed value on stack, current idx %d",          \
+    SRL_STACK_TRACE("pushed value on stack, current depth %d",        \
                     (int) SRL_STACK_DEPTH(stack));                    \
 } STMT_END
 
 #define srl_stack_push_val(stack, val) STMT_START {                   \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
                                                                       \
-    if (srl_stack_empty(stack)) {                                     \
+    if (expect_false(srl_stack_empty(stack))) {                       \
         (stack)->ptr = (stack)->begin;                                \
     } else {                                                          \
         if (expect_false(srl_stack_full(stack)))                      \
@@ -124,9 +162,10 @@ srl_stack_destroy(pTHX_ srl_stack_t *stack)
     }                                                                 \
                                                                       \
     *(stack)->ptr = (val);                                            \
+    (stack)->depth++;                                                 \
                                                                       \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
-    SRL_STACK_TRACE("pushed value on stack, current idx %d",          \
+    SRL_STACK_TRACE("pushed value on stack, current depth %d",        \
                     (int) SRL_STACK_DEPTH(stack));                    \
 } STMT_END
 
@@ -140,8 +179,10 @@ srl_stack_destroy(pTHX_ srl_stack_t *stack)
         (stack)->ptr--;                                               \
     }                                                                 \
                                                                       \
+    (stack)->depth--;                                                 \
+                                                                      \
     DEBUG_ASSERT_STACK_SANE(stack);                                   \
-    SRL_STACK_TRACE("poped stack, current idx %d",                    \
+    SRL_STACK_TRACE("poped stack, current depth %d",                  \
                     (int) SRL_STACK_DEPTH(stack));                    \
 } STMT_END
 

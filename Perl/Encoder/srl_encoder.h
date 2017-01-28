@@ -27,7 +27,11 @@ typedef struct {
     UV recursion_depth;       /* current Perl-ref recursion depth */
     ptable_ptr ref_seenhash;  /* ptr table for avoiding circular refs */
     ptable_ptr weak_seenhash; /* ptr table for avoiding dangling weakrefs */
-    ptable_ptr str_seenhash;  /* ptr table for issuing COPY commands based on PTRS (used for classnames and keys) */
+    ptable_ptr str_seenhash;  /* ptr table for issuing COPY commands based on PTRS (used for classnames and keys)
+                               * for now this is also coopted to track which objects we have dumped as objects,
+                               * and to ensure we only output a given object once.
+                               * Possibly this should be replaced with freezeobj_svhash, but this works fine.
+                               */
     ptable_ptr freezeobj_svhash; /* ptr table for tracking objects and their frozen replacments via FREEZE */
     HV *string_deduper_hv;    /* track strings we have seen before, by content */
 
@@ -37,12 +41,23 @@ typedef struct {
 
                               /* only used if SRL_F_ENABLE_FREEZE_SUPPORT is set. */
     SV *sereal_string_sv;     /* SV that says "Sereal" for FREEZE support */
+    SV *scratch_sv;           /* SV used by encoder for scratch operations */
 } srl_encoder_t;
 
 typedef struct {
     SV *sv;
     U32 hash;
 } sv_with_hash;
+
+typedef struct {
+    union {
+        SV *sv;
+    } key;
+    union {
+        HE *he;
+        SV *sv;
+    } val;
+} HE_SV;
 
 /* constructor from options */
 srl_encoder_t *srl_build_encoder_struct(pTHX_ HV *opt, sv_with_hash *options);
@@ -83,10 +98,12 @@ SV *srl_dump_data_structure_mortal_sv(pTHX_ srl_encoder_t *enc, SV *src, SV *use
  * set since we otherwise croak.  Corresponds to the 'warn_unknown' option. */
 #define SRL_F_WARN_UNKNOWN                      0x00020UL
 
-/* WARNING: SRL_F_COMPRESS_SNAPPY               0x00040UL
- *          SRL_F_COMPRESS_SNAPPY_INCREMENTAL   0x00080UL
- *          SRL_F_COMPRESS_ZLIB                 0x00100UL
- *          are moved to srl_compress.h */
+/* WARNING:
+ * #define SRL_F_COMPRESS_SNAPPY               0x00040UL
+ * #define SRL_F_COMPRESS_SNAPPY_INCREMENTAL   0x00080UL
+ * #define SRL_F_COMPRESS_ZLIB                 0x00100UL
+ * are moved to srl_compress.h
+ */
 
 /* Only meaningful if SRL_F_WARN_UNKNOWN also set. If this one is set, then we don't warn
  * if the unsupported item has string overloading. */
@@ -115,13 +132,15 @@ SV *srl_dump_data_structure_mortal_sv(pTHX_ srl_encoder_t *enc, SV *src, SV *use
 /* if set in flags, then do not use ARRAYREF or HASHREF ever */
 #define SRL_F_CANONICAL_REFS                    0x08000UL
 
+#define SRL_F_SORT_KEYS_PERL                    0x10000UL
+#define SRL_F_SORT_KEYS_PERL_REV                0x20000UL
 /* ====================================================================
  * oper flags
  */
 /* Set while the encoder is in active use / dirty */
 #define SRL_OF_ENCODER_DIRTY                 1UL
 
-#define SRL_ENC_HAVE_OPTION(enc, flag_num) ((enc)->flags & flag_num)
+#define SRL_ENC_HAVE_OPTION(enc, flag_num) ((enc)->flags & (flag_num))
 #define SRL_ENC_SET_OPTION(enc, flag_num) STMT_START {(enc)->flags |= (flag_num);}STMT_END
 #define SRL_ENC_RESET_OPTION(enc, flag_num) STMT_START {(enc)->flags &= ~(flag_num);}STMT_END
 
@@ -131,6 +150,14 @@ SV *srl_dump_data_structure_mortal_sv(pTHX_ srl_encoder_t *enc, SV *src, SV *use
 
 #define SRL_ENC_SV_COPY_ALWAYS 0x00000000UL
 #define SRL_ENC_SV_REUSE_MAYBE 0x00000001UL
+
+#define SRL_UNSUPPORTED_SvTYPE(svt) (   \
+    /* svt == SVt_INVLIST || */         \
+    svt == SVt_PVGV ||                  \
+    svt == SVt_PVCV ||                  \
+    svt == SVt_PVFM ||                  \
+    svt == SVt_PVIO ||                  \
+    0 )
 
 /* by default we do not allow people to build with support for SRL_HDR_LONG_DOUBLE */
 #if defined(SRL_ALLOW_LONG_DOUBLE) && defined(USE_LONG_DOUBLE) && defined(HAS_LONG_DOUBLE)

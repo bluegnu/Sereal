@@ -59,9 +59,9 @@
  * http://en.wikipedia.org/wiki/FLAGS_register_(computing)
  */
 #ifdef SRL_X86_OR_X64_CPU
-#  if __x86_64__ || __x86_64
+#  if defined(__x86_64__) || defined(__x86_64)
 #    define SRL_TRY_ENABLE_STRICT_ALIGN() asm("pushf\norl $0x40000, (%rsp)\npopf")
-#  elif __i386__ || __i386
+#  elif defined(__i386__) || defined(__i386)
 #    define SRL_TRY_ENABLE_STRICT_ALIGN() asm("pushf\norl $0x40000, (%esp)\npopf")
 #  endif
 #else
@@ -71,5 +71,26 @@
 /* define constant for other code to use in preallocations or buffer space
  * assertions */
 #define SRL_MAX_VARINT_LENGTH 11
+
+
+/* perl 5.25 op_sibling renaming related compat macros. Should probably
+ * live in ppport or so. */
+
+#ifndef OpSIBLING
+# define OpSIBLING(op) ((op)->op_sibling)
+#endif
+
+#ifndef OpHAS_SIBLING
+# define OpHAS_SIBLING(op) ((op)->op_sibling != NULL)
+#endif
+
+/* This is completely opting out, sigh */
+#ifndef op_parent
+# undef OpLASTSIB_set
+# undef OpMORESIB_set
+# define op_parent(op) NULL
+# define OpMORESIB_set(op, sib) ((op)->op_sibling = (sib))
+# define OpLASTSIB_set(op, parent) ((op)->op_sibling = NULL)
+#endif
 
 #endif

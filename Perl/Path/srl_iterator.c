@@ -64,62 +64,104 @@ extern "C" {
 #include "srl_iterator.h"
 #include "srl_decoder.h"
 #include "srl_reader_misc.h"
+#define WANT_SRL_RDR_TRACE /* allow use of SRL_RDR_TRACE */
 #include "srl_reader_error.h"
 #include "srl_reader_varint.h"
 #include "srl_reader_decompress.h"
 
-#define srl_stack_push_and_set(iter, tag, length) STMT_START {  \
-    srl_iterator_stack_ptr _stack_ptr;                          \
-    srl_stack_push_ptr((iter)->stack, _stack_ptr);              \
-    _stack_ptr->offset = SRL_RDR_BODY_POS_OFS((iter->pbuf));    \
-    _stack_ptr->count = (length);                               \
-    _stack_ptr->idx = (length);                                 \
-    _stack_ptr->tag = (tag);                                    \
+#define SRL_RDR_BODY_POS_OFS_(buf) ((buf).pos - (buf).body_pos)
+#define srl_stack_push_and_set(_iter, _tag, _length, _stack_ptr) STMT_START {   \
+    srl_stack_push_ptr((_iter)->pstack, (_stack_ptr));                          \
+    (_stack_ptr)->ridx = (_length);                                             \
+    (_stack_ptr)->length = (_length);                                           \
+    (_stack_ptr)->offset = SRL_RDR_BODY_POS_OFS_((_iter)->buf);                 \
+    (_stack_ptr)->prev_depth= 0;                                                \
+    (_stack_ptr)->tag = (_tag);                                                 \
 } STMT_END
 
-#define srl_stack_type_t srl_iterator_stack_t
-#include "srl_stack.h"
+#define SRL_ITER_STACK_PREALLOCATE (32)
+#define SRL_ITER_STACK_ROOT_TAG SRL_HDR_PACKET_START
+#define SRL_ITER_STACK_ON_ROOT(stack) ((stack)->ptr->tag == SRL_ITER_STACK_ROOT_TAG)
 
-#define SRL_ITER_NOT_FOUND (0) /* 0 is invalid offset */
 #define SRL_ITER_BASE_ERROR_FORMAT              "Sereal::Path::Iterator: Error in %s:%u "
 #define SRL_ITER_BASE_ERROR_ARGS                __FILE__, __LINE__
 
 #define SRL_ITER_ERROR(msg)                     croak(SRL_ITER_BASE_ERROR_FORMAT "%s", SRL_ITER_BASE_ERROR_ARGS, (msg))
 #define SRL_ITER_ERRORf1(fmt, var)              croak(SRL_ITER_BASE_ERROR_FORMAT fmt,  SRL_ITER_BASE_ERROR_ARGS, (var))
 #define SRL_ITER_ERRORf2(fmt, var1, var2)       croak(SRL_ITER_BASE_ERROR_FORMAT fmt,  SRL_ITER_BASE_ERROR_ARGS, (var1), (var2))
+#define SRL_ITER_ERRORf3(fmt, var1, var2, var3) croak(SRL_ITER_BASE_ERROR_FORMAT fmt,  SRL_ITER_BASE_ERROR_ARGS, (var1), (var2), (var3))
 
 #ifdef TRACE_ITERATOR
-#   define SRL_ITER_TRACE(msg, args...)            SRL_RDR_TRACE("%s" msg, srl_debug_tabulator(iter), ## args)
-#   define SRL_ITER_REPORT_TAG(iter, tag) STMT_START {                              \
+#   define SRL_ITER_TRACE(msg, args...)                                             \
+        SRL_RDR_TRACE("%s " msg, srl_debug_tabulator(iter), ## args)
+
+#   define SRL_ITER_TRACE_WITH_POSITION(msg, args...) STMT_START {                  \
         SRL_RDR_TRACE(                                                              \
-            "%stag SRL_HDR_%s (int: %d hex: 0x%x) at ofs %"UVuf" body_ofs %"UVuf,   \
-            srl_debug_tabulator((iter)),                                            \
-            SRL_TAG_NAME((tag)),                                                    \
-            (tag), (tag),                                                           \
+            "%s " msg " (ofs %"UVuf" body_ofs %"UVuf")",                            \
+            srl_debug_tabulator(iter),                                              \
+            ## args,                                                                \
             (UV) SRL_RDR_POS_OFS((iter)->pbuf),                                     \
             (UV) SRL_RDR_BODY_POS_OFS((iter)->pbuf)                                 \
         );                                                                          \
     } STMT_END
+
+#   define SRL_ITER_REPORT_TAG(iter, tag) STMT_START {                              \
+        SRL_RDR_TRACE(                                                              \
+            "%s tag SRL_HDR_%s (hex: 0x%x) at ofs %"UVuf" body_ofs %"UVuf,          \
+            srl_debug_tabulator((iter)),                                            \
+            SRL_TAG_NAME((tag)),                                                    \
+            (tag),                                                                  \
+            (UV) SRL_RDR_POS_OFS((iter)->pbuf),                                     \
+            (UV) SRL_RDR_BODY_POS_OFS((iter)->pbuf)                                 \
+        );                                                                          \
+    } STMT_END
+#   define SRL_ITER_REPORT_STACK_STATE(iter) STMT_START {                           \
+        if (srl_stack_empty((iter)->pstack)) {                                      \
+            SRL_RDR_TRACE(                                                          \
+                "%s stack state depth=%"IVdf,                                       \
+                srl_debug_tabulator((iter)),                                        \
+                SRL_STACK_DEPTH((iter)->pstack)                                     \
+            );                                                                      \
+        } else {                                                                    \
+            srl_iterator_stack_ptr stack_ptr = (iter)->stack.ptr;                   \
+            SRL_RDR_TRACE(                                                          \
+                "%s stack state depth=%"IVdf" tag=SRL_HDR_%s (hex: 0x%x)"           \
+                " idx=%d (rdix=%d) offset=%"UVuf" length=%u",                       \
+                srl_debug_tabulator((iter)),                                        \
+                SRL_STACK_DEPTH((iter)->pstack),                                    \
+                SRL_TAG_NAME(stack_ptr->tag),                                       \
+                stack_ptr->tag,                                                     \
+                stack_ptr->length - stack_ptr->ridx,                                \
+                stack_ptr->ridx,                                                    \
+                stack_ptr->offset,                                                  \
+                stack_ptr->length                                                   \
+            );                                                                      \
+        }                                                                           \
+    } STMT_END
 #else
 #   define SRL_ITER_TRACE(msg, args...)
+#   define SRL_ITER_TRACE_WITH_POSITION(msg, args...)
 #   define SRL_ITER_REPORT_TAG(iter, tag)
+#   define SRL_ITER_REPORT_STACK_STATE(iter)
 #endif
 
+// note that it's different from SRL_RDR_DONE()
+#define SRL_RDR_DONE_(buf) ((buf).pos > (buf).end)
 #define SRL_ITER_ASSERT_EOF(iter, msg) STMT_START {                                 \
-    if (expect_false(SRL_RDR_DONE((iter)->pbuf))) {                                 \
+    if (expect_false(SRL_RDR_DONE_((iter)->buf))) {                                 \
         SRL_RDR_ERROR_EOF((iter)->pbuf, (msg));                                     \
     }                                                                               \
 } STMT_END
 
 #define SRL_ITER_ASSERT_STACK(iter) STMT_START {                                    \
-    if (expect_false(srl_stack_empty((iter)->stack))) {                             \
+    assert(!srl_stack_empty((iter)->pstack));                                       \
+    if (expect_false(((int) (iter)->stack.ptr->ridx)) < 0) {                        \
         SRL_ITER_ERROR("Stack is empty! Inconsistent state!");                      \
     }                                                                               \
-    assert((iter)->stack->ptr->idx >= 0);                                           \
 } STMT_END
 
 #define SRL_ITER_ASSERT_ARRAY_ON_STACK(iter) STMT_START {                           \
-    U8 _tag = iter->stack->ptr->tag;                                                \
+    U8 _tag = iter->stack.ptr->tag;                                                 \
     if (expect_false(                                                               \
             _tag != SRL_HDR_ARRAY                                                   \
          && (_tag < SRL_HDR_ARRAYREF_LOW || _tag > SRL_HDR_ARRAYREF_HIGH)           \
@@ -131,7 +173,7 @@ extern "C" {
 } STMT_END
 
 #define SRL_ITER_ASSERT_HASH_ON_STACK(iter) STMT_START {                            \
-    U8 _tag = iter->stack->ptr->tag;                                                \
+    U8 _tag = iter->stack.ptr->tag;                                                 \
     if (expect_false(                                                               \
             _tag != SRL_HDR_HASH                                                    \
          && (_tag < SRL_HDR_HASHREF_LOW || _tag > SRL_HDR_HASHREF_HIGH)             \
@@ -143,8 +185,7 @@ extern "C" {
 } STMT_END
 
 /* function declaration */
-SRL_STATIC_INLINE void srl_iterator_step_internal(pTHX_ srl_iterator_t *iter);
-SRL_STATIC_INLINE void srl_iterator_wrap_stack(pTHX_ srl_iterator_t *iter, IV depth);
+SRL_STATIC_INLINE void srl_iterator_rewind_stack_position(pTHX_ srl_iterator_t *iter);
 
 /* wrappers */
 UV srl_iterator_eof(pTHX_ srl_iterator_t *iter)     { return SRL_RDR_DONE(iter->pbuf) ? 1 : 0; }
@@ -155,7 +196,7 @@ srl_debug_tabulator(pTHX_ srl_iterator_t *iter)
 {
     int i = 0;
     static char buf[1024];
-    for (; i < SRL_STACK_DEPTH(iter->stack); ++i) buf[i] = '-';
+    for (; i < SRL_STACK_DEPTH(iter->pstack); ++i) buf[i] = '+';
     buf[i] = '\0';
     return (const char *) buf; // XXX
 }
@@ -163,33 +204,27 @@ srl_debug_tabulator(pTHX_ srl_iterator_t *iter)
 srl_iterator_t *
 srl_build_iterator_struct(pTHX_ HV *opt)
 {
-    srl_stack_t *stack = NULL;
     srl_iterator_t *iter = NULL;
-
     Newx(iter, 1, srl_iterator_t);
-    if (iter == NULL)
-        croak("Out of memory");
+    if (iter == NULL) croak("Out of memory");
+    srl_init_iterator(aTHX_ iter, opt);
+    return iter;
+}
 
-    Newx(stack, 1, srl_stack_t);
-    if (stack == NULL) {
-        Safefree(iter);
-        croak("Out of memory");
-    }
+void
+srl_init_iterator(pTHX_ srl_iterator_t *iter, HV *opt)
+{
+    assert(iter != NULL);
 
-    // TODO inline stack
-    // TODO keep fixed stack size ???
-    if (expect_false(srl_stack_init(aTHX_ stack, 1024) != 0)) {
+    if (expect_false(srl_stack_init(aTHX_ &iter->stack, SRL_ITER_STACK_PREALLOCATE) != 0)) {
         Safefree(iter);
-        Safefree(stack);
         croak("Out of memory");
     }
 
     SRL_RDR_CLEAR(&iter->buf);
     iter->pbuf = &iter->buf;
-    iter->stack = stack;
+    iter->pstack = &iter->stack;
     iter->document = NULL;
-    iter->tmp_buf_owner = NULL;
-    iter->first_tag_offset = 0;
     iter->dec = NULL;
 
     /* load options */
@@ -198,46 +233,61 @@ srl_build_iterator_struct(pTHX_ HV *opt)
         if (svp && SvTRUE(*svp))
             SRL_iter_SET_OPTION(iter, SRL_F_DEDUPE_STRINGS); */
     }
-
-    return iter;
 }
 
 void
-srl_destroy_iterator(pTHX_ srl_iterator_t *iter)
+srl_shallow_copy_iterator(pTHX_ srl_iterator_t *from, srl_iterator_t *to)
 {
-    if (iter->stack) {
-        srl_stack_destroy(aTHX_ iter->stack);
-        Safefree(iter->stack);
-    }
+    srl_iterator_t *iter = from; // for SRL_ITER_TRACE
+    assert(from != NULL);
+    assert(to != NULL);
+    SRL_ITER_TRACE("from=%p to=%p", from, to);
+
+    if (expect_false(srl_stack_copy(aTHX_ &from->stack, &to->stack)) != 0)
+        croak("Out of memory");
+
+    /* it's assumed that buf holds buffer owned by sv */
+    to->document = from->document;
+    if (to->document) SvREFCNT_inc(to->document);       // shallow document copy
+    Copy(&from->buf, &to->buf, 1, srl_reader_buffer_t); // shallow buffer copy
+
+    to->pstack = &to->stack;
+    to->pbuf = &to->buf;
+    to->dec = NULL;
+
+    assert(to->buf.pos == from->buf.pos);
+}
+
+void
+srl_deinit_iterator(pTHX_ srl_iterator_t *iter)
+{
+    assert(iter != NULL);
 
     if (iter->dec)
         srl_destroy_decoder(aTHX_ iter->dec);
 
     if (iter->document)
         SvREFCNT_dec(iter->document);
-
-    if (iter->tmp_buf_owner)
-        SvREFCNT_dec(iter->tmp_buf_owner);
-
-    Safefree(iter);
-    return;
 }
 
 void
-srl_iterator_set_document(pTHX_ srl_iterator_t *iter, SV *src)
+srl_destroy_iterator(pTHX_ srl_iterator_t *iter)
 {
+    srl_deinit_iterator(aTHX_ iter);
+    Safefree(iter);
+}
+
+void
+srl_iterator_set(pTHX_ srl_iterator_t *iter, SV *src)
+{
+    SV *sv;
     STRLEN len;
     UV header_len;
     U8 encoding_flags;
     U8 protocol_version;
     srl_reader_char_ptr tmp;
     IV proto_version_and_encoding_flags_int;
-
-    /* clear previous buffer */
-    if (iter->tmp_buf_owner) {
-        SvREFCNT_dec(iter->tmp_buf_owner);
-        iter->tmp_buf_owner = NULL;
-    }
+    srl_iterator_stack_ptr stack_ptr = NULL;
 
     if (iter->document) {
         SvREFCNT_dec(iter->document);
@@ -277,11 +327,15 @@ srl_iterator_set_document(pTHX_ srl_iterator_t *iter, SV *src)
     } else if (   encoding_flags == SRL_PROTOCOL_ENCODING_SNAPPY
                || encoding_flags == SRL_PROTOCOL_ENCODING_SNAPPY_INCREMENTAL)
     {
-        srl_decompress_body_snappy(aTHX_ iter->pbuf, encoding_flags, &iter->tmp_buf_owner);
-        SvREFCNT_inc(iter->tmp_buf_owner);
+        srl_decompress_body_snappy(aTHX_ iter->pbuf, encoding_flags, &sv);
+        SvREFCNT_dec(iter->document);
+        SvREFCNT_inc(sv);
+        iter->document = sv;
     } else if (encoding_flags == SRL_PROTOCOL_ENCODING_ZLIB) {
-        srl_decompress_body_zlib(aTHX_ iter->pbuf, &iter->tmp_buf_owner);
-        SvREFCNT_inc(iter->tmp_buf_owner);
+        srl_decompress_body_zlib(aTHX_ iter->pbuf, &sv);
+        SvREFCNT_dec(iter->document);
+        SvREFCNT_inc(sv);
+        iter->document = sv;
     } else {
         SRL_RDR_ERROR(iter->pbuf, "Sereal document encoded in an unknown format");
     }
@@ -290,169 +344,327 @@ srl_iterator_set_document(pTHX_ srl_iterator_t *iter, SV *src)
     SRL_RDR_UPDATE_BODY_POS(iter->pbuf, protocol_version);
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 
-    iter->first_tag_offset = SRL_RDR_BODY_POS_OFS(iter->pbuf);
+    srl_stack_push_and_set(iter, SRL_ITER_STACK_ROOT_TAG, 1, stack_ptr);
     srl_iterator_reset(aTHX_ iter);
 }
 
 void
 srl_iterator_reset(pTHX_ srl_iterator_t *iter)
 {
-    U8 tag = '\0';
-    SRL_ITER_TRACE();
-    srl_stack_clear(iter->stack);
-    srl_stack_push_and_set(iter, tag, 1);
-    iter->buf.pos = iter->buf.body_pos + iter->first_tag_offset;
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-}
+    srl_stack_t *stack = iter->pstack;
+    SRL_ITER_TRACE("--------------------------");
 
-SRL_STATIC_INLINE void
-srl_iterator_wrap_stack(pTHX_ srl_iterator_t *iter, IV expected_depth)
-{
-    srl_stack_t *stack = iter->stack;
-    if (expect_false(SRL_STACK_DEPTH(stack) < expected_depth))
-        SRL_ITER_ERRORf2("expected depth %"IVdf" is higher than current depth %"IVdf,
-                         expected_depth, SRL_STACK_DEPTH(stack));
-
-    while (!srl_stack_empty(stack) && stack->ptr->idx == 0) {
-        if (SRL_STACK_DEPTH(stack) == expected_depth) break;
-        srl_stack_pop_nocheck(stack);
-        if (srl_stack_empty(stack))
-            SRL_ITER_TRACE("end of stack reached");
-    }
-}
-
-/* Main routine. Caller must ensure that EOF is NOT reached */
-SRL_STATIC_INLINE void
-srl_iterator_step_internal(pTHX_ srl_iterator_t *iter)
-{
-    U8 tag;
-    UV length;
-    srl_stack_t *stack = iter->stack;
-
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-
-    srl_iterator_wrap_stack(aTHX_ iter, -1);
-    if (srl_stack_empty(stack)) return;
-
-    SRL_ITER_ASSERT_STACK(iter);
-
-    stack->ptr->idx--;
-    SRL_ITER_TRACE("stack->ptr: idx=%d depth=%d",
-                   stack->ptr->idx, (int) SRL_STACK_DEPTH(stack));
-
-    SRL_ITER_ASSERT_STACK(iter);
-
-read_again:
-    tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;
-    SRL_ITER_REPORT_TAG(iter, tag);
-    iter->buf.pos++;
-
-    /* No code which decrease step, next or stack's counters should be added here.
-     * Otherwise the counters will be decreased twicer for tags like REFN, ALIAS, etc. */
-
-    switch (tag) {
-        CASE_SRL_HDR_SHORT_BINARY:
-            iter->buf.pos += SRL_HDR_SHORT_BINARY_LEN_FROM_TAG(tag);
-            break;
-
-        case SRL_HDR_HASH:
-            length = srl_read_varint_uv_count(aTHX_ iter->pbuf, " while reading HASH");
-            if (length > 0) srl_stack_push_and_set(iter, tag, length * 2);
-            break;
-
-        case SRL_HDR_ARRAY:
-            length = srl_read_varint_uv_count(aTHX_ iter->pbuf, " while reading ARRAY");
-            if (length > 0) srl_stack_push_and_set(iter, tag, length);
-            break;
-
-        CASE_SRL_HDR_HASHREF:
-            length = SRL_HDR_HASHREF_LEN_FROM_TAG(tag);
-            if (length > 0) srl_stack_push_and_set(iter, tag, length * 2);
-            break;
-
-        CASE_SRL_HDR_ARRAYREF:
-            length = SRL_HDR_ARRAYREF_LEN_FROM_TAG(tag);
-            if (length > 0) srl_stack_push_and_set(iter, tag, length);
-            break;
-
-        CASE_SRL_HDR_POS:
-        CASE_SRL_HDR_NEG:
-            break;
-
-        case SRL_HDR_VARINT:
-        case SRL_HDR_ZIGZAG:
-            srl_skip_varint(aTHX_ iter->pbuf);
-            break;
-
-        case SRL_HDR_FLOAT:         iter->buf.pos += 4;      break;
-        case SRL_HDR_DOUBLE:        iter->buf.pos += 8;      break;
-        case SRL_HDR_LONG_DOUBLE:   iter->buf.pos += 16;     break;
-
-        case SRL_HDR_TRUE:
-        case SRL_HDR_FALSE:
-        case SRL_HDR_UNDEF:
-        case SRL_HDR_CANONICAL_UNDEF:
-            break;
-
-        case SRL_HDR_REFN:
-        case SRL_HDR_ALIAS:
-        case SRL_HDR_WEAKEN:
-            goto read_again;
-
-        case SRL_HDR_PAD:
-            while (SRL_RDR_NOT_DONE(iter->pbuf) && *iter->buf.pos++ == SRL_HDR_PAD) {};
-            goto read_again;
-
-        case SRL_HDR_BINARY:
-        case SRL_HDR_STR_UTF8:
-            length = srl_read_varint_uv_length(aTHX_ iter->pbuf, " while reading BINARY or STR_UTF8");
-            iter->buf.pos += length;
-            break;
-
-        case SRL_HDR_COPY:
-        case SRL_HDR_REFP:
-            srl_skip_varint(aTHX_ iter->pbuf);
-            break;
-
-        /* case SRL_HDR_OBJECTV: */
-        /* case SRL_HDR_OBJECTV_FREEZE: */
-        /* case SRL_HDR_REGEXP: */
-        /* case SRL_HDR_OBJECT: */
-        /* case SRL_HDR_OBJECT_FREEZE: */
-
-        default:
-            SRL_RDR_ERROR_UNIMPLEMENTED(iter->pbuf, tag, "");
-            break;
+    while (!SRL_ITER_STACK_ON_ROOT(stack)) {
+        srl_stack_pop(stack); // does empty check internally
     }
 
+    srl_iterator_rewind_stack_position(aTHX_ iter);
+}
+
+IV
+srl_iterator_unite(pTHX_ srl_iterator_t *iter)
+{
+    UV offset;
+    srl_stack_t *stack = iter->pstack;
+    SRL_ITER_TRACE("--------------------------");
+
+    if (expect_false(SRL_STACK_DEPTH(stack) <= 0))
+        SRL_ITER_ERROR("There is nothing to unite. Please call disjoin first.");
+
+    while (!SRL_ITER_STACK_ON_ROOT(stack)) {
+        srl_stack_pop(stack);
+    }
+
+    offset = stack->ptr->offset;
+    srl_stack_pop(stack); // remove SRL_ITER_STACK_ROOT_TAG
+
+    SRL_ITER_ASSERT_STACK(iter);
+    iter->buf.pos = iter->buf.body_pos + offset;
+
+    SRL_ITER_TRACE_WITH_POSITION("after unite");
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+    return iter->stack.depth;
+}
+
+IV
+srl_iterator_disjoin(pTHX_ srl_iterator_t *iter)
+{
+    srl_iterator_stack_ptr stack_ptr;
+
+    SRL_ITER_TRACE_WITH_POSITION("before disjoin");
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    // This record apart of being a boundary stores offset to ridx's tag (i.e
+    // current tag). By default stack keeps offset to tag's starting point
+    // (i.e. continer located in the buf).
+
+    srl_stack_push_ptr(iter->pstack, stack_ptr);
+    stack_ptr->offset = SRL_RDR_BODY_POS_OFS(iter->pbuf); // disjoint point
+    stack_ptr->tag = SRL_ITER_STACK_ROOT_TAG;
+    stack_ptr->length = 1;
+    stack_ptr->ridx = 1;
+
+    return iter->stack.depth;
+}
+
+
+SRL_STATIC_INLINE void
+srl_iterator_rewind_stack_position(pTHX_ srl_iterator_t *iter)
+{
+    SRL_ITER_ASSERT_STACK(iter);
+
+    iter->stack.ptr->ridx = iter->stack.ptr->length;
+    iter->buf.pos = iter->buf.body_pos + iter->stack.ptr->offset;
+
+    SRL_ITER_TRACE_WITH_POSITION("after rewind");
+    SRL_ITER_REPORT_STACK_STATE(iter);
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 }
+
+#define srl_iterator_wrap_stack(iter, expected_depth, stack_ptr) STMT_START {                   \
+    SRL_ITER_TRACE_WITH_POSITION("wrap_stack depth=%"IVdf, (IV) (expected_depth));              \
+    SRL_ITER_REPORT_STACK_STATE(iter);                                                          \
+                                                                                                \
+    assert((((IV) (expected_depth)) > iter->stack.depth) == 0);                                 \
+                                                                                                \
+    while (    (iter)->stack.depth != (IV) (expected_depth)                                     \
+            && (stack_ptr)->ridx == 0                                                           \
+            && (stack_ptr)->tag != SRL_ITER_STACK_ROOT_TAG                                      \
+          )                                                                                     \
+    {                                                                                           \
+        srl_stack_pop_nocheck((iter)->pstack);                                                  \
+        SRL_ITER_REPORT_STACK_STATE((iter));                                                    \
+        (stack_ptr) = (iter)->stack.ptr;                                                        \
+                                                                                                \
+        if ((stack_ptr)->prev_depth) {                                                          \
+            iter->buf.pos = iter->buf.body_pos + (stack_ptr)->prev_depth;                       \
+            (stack_ptr)->prev_depth = 0;                                                        \
+                                                                                                \
+            /* Offset stored in prev_depth is offset of REFP tag. */                            \
+            /* At the same time, ridx was already decremented for REFP (see comments in */      \
+            /* srl_iterator_step_internal(). To compensate this, we increate ridx. */           \
+            (stack_ptr)->ridx++;                                                                \
+                                                                                                \
+            SRL_ITER_TRACE_WITH_POSITION("wrap_stack restore offset");                          \
+            DEBUG_ASSERT_RDR_SANE(iter->pbuf);                                                  \
+            SRL_ITER_REPORT_STACK_STATE(iter);                                                  \
+        }                                                                                       \
+                                                                                                \
+        if (SRL_ITER_STACK_ON_ROOT(iter->pstack))                                               \
+            SRL_ITER_TRACE_WITH_POSITION("root of stack reached");                              \
+    }                                                                                           \
+} STMT_END
+
+/* Main routine. Caller MUST ensure that EOF is NOT reached */
+/* and MUST call srl_iterator_wrap_stack before calling srl_iterator_step_internal() */
+#define srl_iterator_step_internal(iter, stack_ptr) STMT_START {                                \
+    U8 tag;                                                                                     \
+    UV length;                                                                                  \
+                                                                                                \
+    if (expect_false((stack_ptr)->ridx == 0))                                                   \
+        SRL_ITER_ERRORf1("Nothing to parse at depth=%"IVdf, SRL_STACK_DEPTH(iter->pstack));     \
+                                                                                                \
+    /* Iterator decrement ridx *before* parsing an element. This's done for simplicity. */      \
+    /* Also, it has some sense. For scalars there is no difference in when idx is decremented.*/\
+    /* For arrays/hashes/and objects think this way: element at current depth will be */        \
+    /* parsed as soon as iterator finished parsing element at depth+1. */                       \
+    (stack_ptr)->ridx--;                                                                        \
+                                                                                                \
+    SRL_ITER_ASSERT_STACK(iter);                                                                \
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);                                                          \
+                                                                                                \
+read_again:                                                                                     \
+    if (expect_false(SRL_RDR_DONE(iter->pbuf))) {                                               \
+        SRL_ITER_ERROR("EOF is reached");                                                       \
+    }                                                                                           \
+                                                                                                \
+    tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;                                                 \
+    SRL_ITER_REPORT_TAG(iter, tag);                                                             \
+    iter->buf.pos++;                                                                            \
+                                                                                                \
+    /* No code which decrease step, next or stack's counters should be added here.              \
+     * Otherwise the counters will be decreased twicer for tags like REFN, WEAKEN , etc. */     \
+                                                                                                \
+    switch (tag & 0xE0) {                                                                       \
+        case 0x0: /* POS_0 .. NEG_1 */                                                          \
+            break;                                                                              \
+                                                                                                \
+        case 0x40: /* ARRAYREF_0 .. HASHREF_15 */                                               \
+            /* for HASHREF_0 .. HASHREF_15 multiple length by two */                            \
+            length = (tag & 0xF) << ((tag & 0x10) ? 1 : 0);                                     \
+            srl_stack_push_and_set(iter, tag, length, stack_ptr);                               \
+            break;                                                                              \
+                                                                                                \
+        case 0x60: /* SHORT_BINARY_0 .. SHORT_BINARY_31 */                                      \
+            iter->buf.pos += SRL_HDR_SHORT_BINARY_LEN_FROM_TAG(tag);                            \
+            break;                                                                              \
+                                                                                                \
+        default:                                                                                \
+            switch (tag) {                                                                      \
+                case SRL_HDR_HASH:                                                              \
+                    length = srl_read_varint_uv_count(aTHX_ iter->pbuf, " while reading HASH"); \
+                    srl_stack_push_and_set(iter, tag, length * 2, stack_ptr);                   \
+                    break;                                                                      \
+                                                                                                \
+                case SRL_HDR_ARRAY:                                                             \
+                    length = srl_read_varint_uv_count(aTHX_ iter->pbuf, " while reading ARRAY");\
+                    srl_stack_push_and_set(iter, tag, length, stack_ptr);                       \
+                    break;                                                                      \
+                                                                                                \
+                case SRL_HDR_VARINT:                                                            \
+                case SRL_HDR_ZIGZAG:                                                            \
+                    srl_skip_varint(aTHX_ iter->pbuf);                                          \
+                    break;                                                                      \
+                                                                                                \
+                case SRL_HDR_FLOAT:         iter->buf.pos += 4;      break;                     \
+                case SRL_HDR_DOUBLE:        iter->buf.pos += 8;      break;                     \
+                case SRL_HDR_LONG_DOUBLE:   iter->buf.pos += 16;     break;                     \
+                                                                                                \
+                case SRL_HDR_TRUE:                                                              \
+                case SRL_HDR_FALSE:                                                             \
+                case SRL_HDR_UNDEF:                                                             \
+                case SRL_HDR_CANONICAL_UNDEF:                                                   \
+                    break;                                                                      \
+                                                                                                \
+                case SRL_HDR_REFN:                                                              \
+                case SRL_HDR_WEAKEN:                                                            \
+                    goto read_again;                                                            \
+                                                                                                \
+                case SRL_HDR_PAD:                                                               \
+                    while (SRL_RDR_NOT_DONE(iter->pbuf) && *iter->buf.pos++ == SRL_HDR_PAD) {}; \
+                    goto read_again;                                                            \
+                                                                                                \
+                case SRL_HDR_BINARY:                                                            \
+                case SRL_HDR_STR_UTF8:                                                          \
+                    length = srl_read_varint_uv_length(aTHX_ iter->pbuf,                        \
+                                                      " while reading BINARY or STR_UTF8");     \
+                    iter->buf.pos += length;                                                    \
+                    break;                                                                      \
+                                                                                                \
+                case SRL_HDR_COPY:                                                              \
+                case SRL_HDR_REFP:                                                              \
+                case SRL_HDR_ALIAS:                                                             \
+                    srl_skip_varint(aTHX_ iter->pbuf);                                          \
+                    break;                                                                      \
+                                                                                                \
+                /* case SRL_HDR_OBJECTV: */                                                     \
+                /* case SRL_HDR_OBJECTV_FREEZE: */                                              \
+                /* case SRL_HDR_REGEXP: */                                                      \
+                /* case SRL_HDR_OBJECT: */                                                      \
+                /* case SRL_HDR_OBJECT_FREEZE: */                                               \
+                                                                                                \
+                default:                                                                        \
+                    SRL_RDR_ERROR_UNIMPLEMENTED(iter->pbuf, tag, "");                           \
+                    break;                                                                      \
+            }                                                                                   \
+    }                                                                                           \
+                                                                                                \
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);                                                          \
+} STMT_END
 
 /* srl_iterator_step_in() does N steps. Where step is a serialized object */
 
 void
 srl_iterator_step_in(pTHX_ srl_iterator_t *iter, UV n)
 {
-    srl_stack_t *stack = iter->stack;
+    UV offset;
+    U8 tag, otag;
+    srl_reader_char_ptr orig_pos;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("n=%"UVuf, n);
-
     SRL_ITER_ASSERT_STACK(iter);
+
+    SRL_ITER_TRACE_WITH_POSITION("n=%"UVuf, n);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    while (n--) {
+        srl_iterator_wrap_stack(iter, -1, stack_ptr);
+
+        orig_pos = iter->buf.pos;
+        tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;
+        SRL_ITER_REPORT_TAG(iter, tag);
+        iter->buf.pos++;
+
+        if (tag == SRL_HDR_REFP || tag == SRL_HDR_ALIAS) {
+            /* store offset for REFP tag. Will be used in srl_iterator_wrap_stack() */
+            stack_ptr->prev_depth = orig_pos - iter->buf.body_pos; // almost same sa SRL_RDR_BODY_POS_OFS
+
+            offset = srl_read_varint_uv_offset(aTHX_ iter->pbuf, " while reading REFP tag");
+            iter->buf.pos = iter->buf.body_pos + offset;
+            DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+
+            tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;
+            SRL_ITER_TRACE_WITH_POSITION("tag SRL_HDR_REFP points to tag SRL_HDR_%s",
+                                         SRL_TAG_NAME(tag));
+
+            switch (tag) {
+                case SRL_HDR_HASH:
+                case SRL_HDR_ARRAY:
+                    break;
+
+                case SRL_HDR_OBJECTV:
+                case SRL_HDR_OBJECTV_FREEZE:
+                case SRL_HDR_OBJECT:
+                case SRL_HDR_OBJECT_FREEZE:
+                    croak("not implemented OBJECT");
+
+                CASE_SRL_HDR_HASHREF:
+                CASE_SRL_HDR_ARRAYREF:
+                    croak("not implemente HASHREF ARRAYREF");
+
+                default:
+                    stack_ptr->prev_depth = 0;
+                    iter->buf.pos = orig_pos;
+                    break;
+            }
+        } else {
+            stack_ptr->prev_depth = 0;
+            iter->buf.pos = orig_pos;
+        }
+
+        srl_iterator_step_internal(iter, stack_ptr);
+    }
+
+    SRL_ITER_TRACE_WITH_POSITION("Completed expected number of steps");
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+}
+
+void
+srl_iterator_step_out(pTHX_ srl_iterator_t *iter, UV n)
+{
+    U32 idx;
+    IV depth = iter->stack.depth;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
+
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+    SRL_ITER_ASSERT_STACK(iter);
+
+    SRL_ITER_TRACE_WITH_POSITION("n=%"UVuf, n);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
     if (expect_false(n == 0)) return;
 
-    while (expect_true(!srl_stack_empty(stack))) {
-        if (n == 0) break;
-        srl_iterator_step_internal(aTHX_ iter);
-        n--;
+    while (n--) {
+        if (expect_false(stack_ptr->tag == SRL_ITER_STACK_ROOT_TAG)) {
+            SRL_ITER_ERROR("Root of the stack is reached");
+        }
+
+        stack_ptr--;
+        depth--;
     }
 
-    if (expect_false(n != 0)) {
-        SRL_ITER_ERRORf1("Failed to do %"UVuf" steps. Likely EOF was reached", n);
-    }
+    idx = stack_ptr->length - stack_ptr->ridx;
+    SRL_ITER_TRACE_WITH_POSITION("target depth: %"UVuf" idx=%u ridx=%d (length=%d at target depth)",
+                                 depth, idx, stack_ptr->ridx, stack_ptr->length);
 
-    SRL_ITER_TRACE("Did expected number of steps");
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+    assert(idx >= 0);
+    assert(idx <= stack_ptr->length);
+    assert(depth >= 0);
+
+    srl_iterator_until(aTHX_ iter, (UV) depth, idx);
 }
 
 /* srl_iterator_next() does N step on current stack.
@@ -461,164 +673,173 @@ srl_iterator_step_in(pTHX_ srl_iterator_t *iter, UV n)
 void
 srl_iterator_next(pTHX_ srl_iterator_t *iter, UV n)
 {
-    srl_stack_t *stack = iter->stack;
-    IV expected_depth = SRL_STACK_DEPTH(stack);
+    IV expected_depth = iter->stack.depth;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("n=%"UVuf, n);
-
     SRL_ITER_ASSERT_STACK(iter);
-    if (expect_false(n == 0)) return;
-    if (expect_false(stack->ptr->idx == 0))
-        SRL_ITER_ERROR("Nothing to parse at this depth");
 
-    while (expect_true(!srl_stack_empty(stack))) {
-        if (SRL_STACK_DEPTH(stack) == expected_depth) {
+    SRL_ITER_TRACE_WITH_POSITION("n=%"UVuf, n);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    if (expect_false(n == 0)) return;
+
+    while (1) {
+        srl_iterator_wrap_stack(iter, expected_depth, stack_ptr);
+
+        if (iter->stack.depth == expected_depth) {
             if (n == 0) break;
             else n--;
         }
 
-        srl_iterator_step_internal(aTHX_ iter);
-        srl_iterator_wrap_stack(aTHX_ iter, expected_depth);
+        srl_iterator_step_internal(iter, stack_ptr);
     }
 
     if (expect_false(n != 0)) {
         SRL_ITER_ERRORf1("Failed to do %"UVuf" next steps. Likely EOF was reached", n);
     }
 
-    if (expect_false(SRL_STACK_DEPTH(stack) != expected_depth)) {
+    if (expect_false(iter->stack.depth != expected_depth)) {
         SRL_ITER_ERRORf2("next() led to wrong stack depth, expected=%"IVdf", actual=%"IVdf,
-                          expected_depth, SRL_STACK_DEPTH(stack));
+                          expected_depth, iter->stack.depth);
     }
 
-    SRL_ITER_TRACE("Did expected number of steps at depth %"IVdf, expected_depth);
+    SRL_ITER_TRACE_WITH_POSITION("Did expected number of steps at depth %"IVdf, expected_depth);
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 }
 
-/* srl_iterator_next_until_depth_and_idx() moves iterator forward until
- * expected stack level (depth) and index is reached. It can only go down the stack. */
+/* srl_iterator_until() moves iterator forward until expected stack level
+ * (depth) and index is reached. It can only go down the stack. */
 
 void
-srl_iterator_next_until_depth_and_idx(pTHX_ srl_iterator_t *iter, UV expected_depth, U32 expected_idx) {
-    U32 current_idx;
-    srl_stack_t *stack = iter->stack;
-    IV current_depth = SRL_STACK_DEPTH(stack);
+srl_iterator_until(pTHX_ srl_iterator_t *iter, UV depth, U32 idx) {
+    I32 ridx;
+    IV current_depth = iter->stack.depth;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("expected_depth=%"UVuf" expected_idx=%u",
-                   expected_depth, expected_idx);
-
     SRL_ITER_ASSERT_STACK(iter);
-    if (expect_false((IV) expected_depth > current_depth)) {
-        SRL_ITER_ERRORf2("srl_iterator_next_until_depth() can only go forward, "
-                         "so expected_depth=%"UVuf" should not be greater then current_depth=%"IVdf,
-                         expected_depth, current_depth);
+
+    SRL_ITER_TRACE_WITH_POSITION("depth=%"UVuf" idx=%d", depth, idx);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    if (expect_false((IV) depth > current_depth)) {
+        SRL_ITER_ERRORf2("srl_iterator_until() can only go forward, "
+                         "so depth=%"UVuf" should not be greater then current_depth=%"IVdf,
+                         depth, current_depth);
     }
 
-    current_idx = stack->ptr->idx;
-    if (expect_false((IV) expected_depth == current_depth && expected_idx == current_idx))
+    stack_ptr = iter->stack.begin + depth;
+    ridx = stack_ptr->length - idx;
+
+    if (expect_false((IV) ridx > stack_ptr->ridx)) {
+        SRL_ITER_ERRORf3("srl_iterator_until() can only go forward, "
+                         "so ridx=%u should not be greater then current "
+                         "index (%u) at depth=%"IVdf,
+                         ridx, stack_ptr->ridx, depth);
+    }
+
+    if (expect_false((IV) depth == current_depth && (IV) ridx == stack_ptr->ridx))
         return;
 
-    while (expect_true(!srl_stack_empty(stack))) {
-        srl_iterator_wrap_stack(aTHX_ iter, expected_depth);
+    stack_ptr = iter->stack.ptr;
 
-        current_depth = SRL_STACK_DEPTH(stack);
-        if (expect_false(srl_stack_empty(stack)))
-            break;
+    while (1) {
+        srl_iterator_wrap_stack(iter, depth, stack_ptr);
 
-        current_idx  = stack->ptr->idx;
-        if (current_depth == (IV) expected_depth && current_idx == expected_idx)
-            break;
-
-        if (expect_false(current_depth == (IV) expected_depth && expected_idx > current_idx)) {
-            SRL_ITER_ERRORf2("srl_iterator_next_until_depth() can only go forward, "
-                             "so expected_idx=%d should not be greater then current_idx=%d",
-                             expected_idx, current_idx);
+        if (iter->stack.depth == (IV) depth) {
+            if (stack_ptr->ridx == (IV) ridx) break;
+            assert(((IV) ridx > stack_ptr->ridx) == 0);
         }
 
-        srl_iterator_step_internal(aTHX_ iter);
+        srl_iterator_step_internal(iter, stack_ptr);
     }
 
-    if (expect_false(current_depth != (IV) expected_depth)) {
-        SRL_ITER_ERRORf2("func led to wrong stack depth, expected=%"IVdf", actual=%"IVdf,
-                          expected_depth, current_depth);
-    }
-
-    if (expect_false(current_idx != expected_idx)) {
-        SRL_ITER_ERRORf2("func led to wrong stack index, expected=%u, actual=%u",
-                          expected_idx, current_idx);
-    }
-
-    SRL_ITER_TRACE("Reached expected stack depth: %"UVuf " and idx: %u",
-                   expected_depth, expected_idx);
+    assert(stack_ptr->ridx == (IV) ridx);
+    assert(iter->stack.depth == (IV) depth);
+    SRL_ITER_TRACE_WITH_POSITION("Reached expected stack depth: %"UVuf " idx: %u ridx: %d", depth, idx, ridx);
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 }
 
 void
-srl_iterator_step_out(pTHX_ srl_iterator_t *iter, UV n)
+srl_iterator_rewind(pTHX_ srl_iterator_t *iter, UV n)
 {
-    UV offset;
-    srl_stack_t *stack = iter->stack;
+    srl_stack_t *stack = iter->pstack;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("n=%"UVuf, n);
-
     SRL_ITER_ASSERT_STACK(iter);
-    // SRL_ITER_ASSERT_EOF(iter, "serialized object"); XXX need ability to go back on last element
-    // if (expect_false(n == 0)) return; XXX keep it as a feature?
+
+    SRL_ITER_TRACE_WITH_POSITION("n=%"UVuf, n);
+    SRL_ITER_REPORT_STACK_STATE(iter);
 
     while (n--) {
-        srl_stack_pop_nocheck(stack);
-        if (expect_false(srl_stack_empty(stack))) {
-            SRL_ITER_ERROR("It was last object on stack, no more parents");
+        if (expect_false(SRL_ITER_STACK_ON_ROOT(stack))) {
+            SRL_ITER_ERROR("Root of the stack is reached");
         }
+
+        srl_stack_pop_nocheck(stack);
     }
 
-    offset = stack->ptr->offset; 
-    iter->buf.pos = iter->buf.body_pos + offset;
-    stack->ptr->idx = stack->ptr->count;
-
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+    srl_iterator_rewind_stack_position(aTHX_ iter);
 }
 
 IV
 srl_iterator_array_goto(pTHX_ srl_iterator_t *iter, I32 idx)
 {
-    I32 s_idx;
-    srl_stack_t *stack = iter->stack;
+    I32 nidx, ridx;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("idx=%d", idx);
-
     SRL_ITER_ASSERT_EOF(iter, "array element");
     SRL_ITER_ASSERT_STACK(iter);
     SRL_ITER_ASSERT_ARRAY_ON_STACK(iter);
 
-    if (idx >= 0) {
-        s_idx = stack->ptr->count - idx;
-        if (idx >= (I32) stack->ptr->count) {
-            SRL_ITER_TRACE("Index is out of range, idx=%d count=%u", idx, stack->ptr->count);
-            return SRL_ITER_NOT_FOUND;
-        }
-    } else {
-        s_idx = -idx;
-        if (s_idx > (I32) stack->ptr->count) {
-            SRL_ITER_TRACE("Index is out of range, idx=%d count=%u", idx, stack->ptr->count);
-            return SRL_ITER_NOT_FOUND;
-        }
+    SRL_ITER_TRACE_WITH_POSITION("idx=%d", idx);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    nidx = srl_iterator_normalize_idx(aTHX_ idx, stack_ptr->length);
+    if (nidx < 0 || nidx >= (I32) stack_ptr->length) {
+        SRL_ITER_TRACE("Index is out of range, idx=%d nidx=%d length=%u",
+                       idx, nidx, stack_ptr->length);
+        return SRL_ITER_NOT_FOUND;
     }
 
-    if (s_idx == stack->ptr->idx) {
+    ridx = stack_ptr->length - nidx;
+    if (ridx == stack_ptr->ridx) {
         return SRL_RDR_BODY_POS_OFS(iter->pbuf); // already at expected position
-    } else if (s_idx > stack->ptr->idx) {
-        SRL_ITER_ERRORf2("Can't go backwards, idx=%d, count=%u",
-                         idx, stack->ptr->count);
+    } else if (ridx > stack_ptr->ridx) {
+        SRL_ITER_ERRORf2("Can't go backwards, ridx=%d, length=%u",
+                         ridx, stack_ptr->length);
     }
 
     // srl_iterator_next garantee that we remans on current stack
-    srl_iterator_next(aTHX_ iter, stack->ptr->idx - s_idx);
-    assert(stack->ptr->idx == s_idx);
+    srl_iterator_next(aTHX_ iter, stack_ptr->ridx - ridx);
+    assert(stack_ptr->ridx == ridx);
     return SRL_RDR_BODY_POS_OFS(iter->pbuf);
+}
+
+IV
+srl_iterator_array_exists(pTHX_ srl_iterator_t *iter, I32 idx)
+{
+    I32 nidx;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
+
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
+    SRL_ITER_ASSERT_EOF(iter, "array element");
+    SRL_ITER_ASSERT_STACK(iter);
+    SRL_ITER_ASSERT_ARRAY_ON_STACK(iter);
+
+    SRL_ITER_TRACE_WITH_POSITION("idx=%d", idx);
+    SRL_ITER_REPORT_STACK_STATE(iter);
+
+    nidx = srl_iterator_normalize_idx(aTHX_ idx, stack_ptr->length);
+    if (nidx < 0 || nidx >= (I32) stack_ptr->length) {
+        SRL_ITER_TRACE("Index is out of range, idx=%d nidx=%d length=%u",
+                       idx, nidx, stack_ptr->length);
+        return SRL_ITER_NOT_FOUND;
+    }
+
+    return nidx;
 }
 
 const char *
@@ -630,11 +851,10 @@ srl_iterator_hash_key(pTHX_ srl_iterator_t *iter, STRLEN *len_out)
     srl_reader_char_ptr orig_pos = iter->buf.pos;
     *len_out = 0;
 
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
     SRL_ITER_ASSERT_EOF(iter, "stringish");
     SRL_ITER_ASSERT_STACK(iter);
     SRL_ITER_ASSERT_HASH_ON_STACK(iter);
-
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 
     tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;
     SRL_ITER_REPORT_TAG(iter, tag);
@@ -719,21 +939,22 @@ srl_iterator_hash_exists(pTHX_ srl_iterator_t *iter, const char *name, STRLEN na
     UV length, offset;
     const char *key_ptr;
 
-    srl_stack_t *stack = iter->stack;
-    IV stack_depth = SRL_STACK_DEPTH(stack);
+    IV stack_depth = iter->stack.depth;
+    srl_iterator_stack_ptr stack_ptr = iter->stack.ptr;
 
+    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
     SRL_ITER_ASSERT_EOF(iter, "stringish");
     SRL_ITER_ASSERT_STACK(iter);
     SRL_ITER_ASSERT_HASH_ON_STACK(iter);
 
-    DEBUG_ASSERT_RDR_SANE(iter->pbuf);
-    SRL_ITER_TRACE("name=%.*s", (int) name_len, name);
+    SRL_ITER_TRACE_WITH_POSITION("name=%.*s", (int) name_len, name);
+    SRL_ITER_REPORT_STACK_STATE(iter);
 
-    while (stack->ptr->idx) {
-        stack->ptr->idx--; // do not make it be part of while clause
+    while (stack_ptr->ridx) {
+        stack_ptr->ridx--; // do not make it be part of while clause
         SRL_ITER_ASSERT_STACK(iter);
-        assert(stack->ptr->idx % 2 == 1);
-        assert(SRL_STACK_DEPTH(stack) == stack_depth);
+        assert(stack_ptr->ridx % 2 == 1);
+        assert(iter->stack.depth == stack_depth);
         DEBUG_ASSERT_RDR_SANE(iter->pbuf);
 
         tag = *iter->buf.pos & ~SRL_HDR_TRACK_FLAG;
@@ -800,13 +1021,13 @@ srl_iterator_hash_exists(pTHX_ srl_iterator_t *iter, const char *name, STRLEN na
         if (   length == name_len
             && memcmp(name, key_ptr, name_len) == 0)
         {
-            SRL_ITER_TRACE("found key '%.*s' at offset %"UVuf,
-                         (int) name_len, name, SRL_RDR_BODY_POS_OFS(iter->pbuf));
+            SRL_ITER_TRACE_WITH_POSITION("found key '%.*s'", (int) name_len, name);
             return SRL_RDR_BODY_POS_OFS(iter->pbuf);
         }
 
         // srl_iterator_next garantee that we remans on current stack
         srl_iterator_next(aTHX_ iter, 1);
+        stack_ptr = iter->stack.ptr;
     }
 
     SRL_ITER_TRACE("didn't found key '%.*s'", (int) name_len, name);
@@ -825,7 +1046,7 @@ UV
 srl_iterator_object_info(pTHX_ srl_iterator_t *iter, UV *length_ptr)
 {
     U8 tag;
-    UV type = 0;
+    UV offset, type = 0;
     srl_reader_char_ptr orig_pos = iter->buf.pos;
 
     DEBUG_ASSERT_RDR_SANE(iter->pbuf);
@@ -883,10 +1104,11 @@ read_again:
             type = SRL_ITERATOR_OBJ_IS_SCALAR;
             break;
 
-        /* case SRL_HDR_COPY:
-            UV offset = srl_read_varint_uv_offset(aTHX_ iter->pbuf, " while reading COPY tag");
+        case SRL_HDR_REFP:
+        case SRL_HDR_COPY:
+            offset = srl_read_varint_uv_offset(aTHX_ iter->pbuf, " while reading COPY tag");
             iter->buf.pos = iter->buf.body_pos + offset;
-            goto read_again; */ // TODO
+            goto read_again;
 
         default:
             iter->buf.pos = orig_pos;
@@ -901,34 +1123,38 @@ read_again:
 srl_iterator_stack_ptr
 srl_iterator_stack(pTHX_ srl_iterator_t *iter)
 {
-    return srl_stack_empty(iter->stack) ? NULL : iter->stack->ptr;
+    return srl_stack_empty(iter->pstack) ? NULL : iter->stack.ptr;
 }
 
 IV
 srl_iterator_stack_depth(pTHX_ srl_iterator_t *iter)
 {
-    return SRL_STACK_DEPTH(iter->stack);
+    return SRL_STACK_DEPTH(iter->pstack);
 }
 
 UV
 srl_iterator_stack_index(pTHX_ srl_iterator_t *iter)
 {
     SRL_ITER_ASSERT_STACK(iter);
-    assert((I32) iter->stack->ptr->count >= iter->stack->ptr->idx); 
-    return (UV) (iter->stack->ptr->count - iter->stack->ptr->idx);
+    assert((I32) iter->stack.ptr->length >= iter->stack.ptr->ridx);
+    return (UV) (iter->stack.ptr->length - iter->stack.ptr->ridx);
 }
 
 UV
 srl_iterator_stack_info(pTHX_ srl_iterator_t *iter, UV *length_ptr)
 {
     UV type = 0;
-    srl_stack_t *stack = iter->stack;
+    srl_stack_t *stack = iter->pstack;
     srl_iterator_stack_ptr stack_ptr = stack->ptr;
 
     SRL_ITER_ASSERT_STACK(iter);
-    if (length_ptr) *length_ptr = stack_ptr->count;
+    if (length_ptr) *length_ptr = stack_ptr->length;
 
     switch (stack_ptr->tag) {
+        case SRL_ITER_STACK_ROOT_TAG:
+            type = SRL_ITERATOR_OBJ_IS_ROOT;
+            break;
+
         case SRL_HDR_HASH:
         CASE_SRL_HDR_HASHREF:
             type = SRL_ITERATOR_OBJ_IS_HASH;
@@ -962,4 +1188,3 @@ srl_iterator_decode(pTHX_ srl_iterator_t *iter)
     srl_decode_single_value(aTHX_ iter->dec, into, NULL);
     return into;
 }
-

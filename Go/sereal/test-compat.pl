@@ -8,6 +8,7 @@ use blib "../../Perl/Encoder/blib/";
 use lib "../../Perl/shared/t/lib/";
 
 use Sereal::Decoder qw(decode_sereal);
+use Sereal::Encoder qw(encode_sereal);
 use Test::More;
 use Data::Dumper;
 
@@ -31,7 +32,7 @@ sub slurp {
 # 100% reliable and accurate. To mitigate it we also maintain a counter holding
 # a total number of tests to be skipped.
 #
-my $skip_total = 194;
+my $skip_total = 216;
 my %skip = map { $_ => 1 } (
     'array ref to aliases blessed array',
     'array ref to aliases complex hash',
@@ -124,6 +125,26 @@ my %skip = map { $_ => 1 } (
     'array ref to aliases undef',
     'array ref to aliases utf8 string',
     'array ref to aliases var strings',
+    'array ref to aliases troublesome num/strs',
+    "array ref to aliases  troublesome num/strs '    1    '",
+    "array ref to aliases  troublesome num/strs '0.0'",
+    "array ref to aliases  troublesome num/strs '00000.0000'",
+    "array ref to aliases  troublesome num/strs '0.0.0.0'",
+    "array ref to aliases  troublesome num/strs '.0'",
+    "array ref to aliases  troublesome num/strs '    .0'",
+    "array ref to aliases  troublesome num/strs ' 22'",
+    "array ref to aliases  troublesome num/strs '01'",
+    "array ref to aliases  troublesome num/strs '01.1'",
+    "array ref to aliases  troublesome num/strs '   0   '",
+    "array ref to aliases  troublesome num/strs '.0'",
+    "array ref to aliases  troublesome num/strs '0.001'",
+    "array ref to aliases  troublesome num/strs '.1'",
+    "array ref to aliases  troublesome num/strs '  .1'",
+    "array ref to aliases  troublesome num/strs '.2'",
+    "array ref to aliases  troublesome num/strs '00'",
+    "array ref to aliases  troublesome num/strs '.00'",
+    "array ref to aliases  troublesome num/strs '0 but true'",
+    "array ref to aliases  troublesome num/strs '0E0'",
     "array ref to aliases largeish negative int -302001",
     "array ref to aliases largeish negative int -1234567",
     "array ref to aliases largeish negative int -12345678",
@@ -226,6 +247,9 @@ my %skip = map { $_ => 1 } (
     'scalar cross',
     'weak scalar cross',
     'weak thing copy (requires PAD)',
+    'BlessedArrayCheck 1',
+    'BlessedArrayCheck 2',
+    'Scalar Cross Blessed Array',
 );
 
 my $skipped = 0;
@@ -285,6 +309,38 @@ for my $n (glob("test_dir/test_data_?????")) {
 }
 
 is($skipped, $skip_total, "skipped expected number of tests");
+
+{
+    foreach my $class ("time.Time", "github.com/Sereal/Sereal/Go/sereal.StructWithTime", "_/home/travis/build/Sereal/Sereal/Go/sereal.StructWithTime") {
+        no strict 'refs';
+        *{"${class}::THAW"} = sub { my ( $pkg, $srl, $val ) = @_; bless \$val, $pkg };
+        *{"${class}::FREEZE"} = sub { ${$_[0]} };
+    }
+
+    for my $n (glob("test_freeze/*-go.out")) {
+        my $testdata = slurp($n);
+        my ( $name ) = ( $n =~ m{([^/]+)-go\.out$} );
+        my $g;
+
+        eval {
+            $g = decode_sereal($testdata);
+            1;
+        } or do {
+            my $err = $@;
+            fail($name);
+            diag("Failed unpacking go $n: $err");
+            next;
+        };
+
+        ( my $perl = $n ) =~ s{-go\.out$}{-perl.out};
+
+        open my $fh, ">", $perl or die "Can't open $perl for writing: $!";
+        print $fh encode_sereal($g, { freeze_callbacks => 1 }) or die "print($perl): $!"; 
+        close $fh or die "close($perl): $!";
+
+        pass($name);
+    }
+}
 
 done_testing();
 

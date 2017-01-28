@@ -4,7 +4,9 @@ use warnings;
 use Data::Dumper;
 
 use Getopt::Long qw(GetOptions);
+use Encode qw(encode_utf8 decode_utf8);
 our @constants;
+no warnings 'recursion';
 BEGIN {
     my $add_use_blib= "";
     my $use= "";
@@ -39,15 +41,21 @@ BEGIN {
 
 my $done;
 my $data;
-my $hlen;
+my $hlen = -1;
 my $indent = "";
+
+sub _chop_data_prefix {
+    my ($len)= @_;
+    die "Unexpected end of packet" unless length($data) >= $len;
+    return substr($data,0,$len,'');
+}
 
 sub parse_header {
   $data =~ s/^(=[s\xF3]rl)(.)// or die "invalid header: $data";
   $done .= $1 . $2;
   my $flags = $2;
   my $len = varint();
-  my $hdr = substr($data, 0, $len, '');
+  my $hdr = _chop_data_prefix( $len );
 
   my $proto_version = ord($flags) & SRL_PROTOCOL_VERSION_MASK;
   print "Sereal protocol version: $proto_version\n";
@@ -98,20 +106,20 @@ sub parse_header {
 my ($len_f, $len_d, $len_D);
 sub parse_float {
     $len_f||= length(pack("f",0));
-    my $v= substr($data,0,$len_f,"");
+    my $v= _chop_data_prefix( $len_f );
     $done .= $v;
     return unpack("f",$v);
 }
 sub parse_double {
     $len_d||= length(pack("d",0));
-    my $v= substr($data,0,$len_d,"");
+    my $v= _chop_data_prefix( $len_d );
     $done .= $v;
     return unpack("d",$v);
 }
 sub parse_long_double {
     $len_D ||= eval { length(pack("D",0.0)) };
     die "Long double not supported" unless $len_D;
-    my $v= substr($data, 0, $len_D, "");
+    my $v= _chop_data_prefix( $len_D );
     $done .= $v;
     return unpack("D",$v);
 }
@@ -123,11 +131,11 @@ sub parse_sv {
   my ($ind) = @_;
 
   my $p= length($done);
-  my $t = substr($data, 0, 1, '');
+  my $t = _chop_data_prefix( 1 );
   $done .= $t;
   my $o = ord($t);
   my $bv= $o;
-  my $high = $o > 128;
+  my $high = $o >= 128;
   $o -= 128 if $high;
   printf $fmt1, $p, $p-$hlen+1, $o, $high ? '*' : ' ', $bv, $ind;
 
@@ -147,15 +155,16 @@ sub parse_sv {
   elsif ($o >= SRL_HDR_SHORT_BINARY_LOW) {
     $o -= SRL_HDR_SHORT_BINARY_LOW;
     my $len = $o;
-    my $str = substr($data, 0, $len, '');
+    my $str = _chop_data_prefix( $len );
     $done .= $str;
-    printf "SHORT_BINARY(%u): '%s'\n", $len, $str;
+    printf "SHORT_BINARY(%u): '%s' (%s)\n", $len, encode_utf8($str), unpack("H*", $str);
   }
   elsif ($o == SRL_HDR_BINARY || $o == SRL_HDR_STR_UTF8) {
     my $l = varint();
-    my $str = substr($data, 0, $l, ""); # fixme UTF8
+    my $str = _chop_data_prefix( $l ); # fixme UTF8
     $done .= $str;
-    printf( ($o == SRL_HDR_STR_UTF8 ? "STR_UTF8" : "BINARY")."(%u): '%s'\n", $l, $str);
+    $str= decode_utf8($str) if $o == SRL_HDR_STR_UTF8;
+    printf( ($o == SRL_HDR_STR_UTF8 ? "STR_UTF8" : "BINARY")."(%u): '%s' (%s)\n", $l, encode_utf8($str), unpack("H*", encode_utf8($str)));
   }
   elsif ($o == SRL_HDR_FLOAT) {
     printf "FLOAT(%f)\n", parse_float();
@@ -269,12 +278,13 @@ sub parse_av {
 
 sub parse_hv {
   my ($ind, $o) = @_;
-  my $len = (defined $o ? $o & 15 : varint()) * 2;
-  printf "(%u)\n", $len / 2;
+  my $len = (defined $o ? $o & 15 : varint());
+  printf "(%u)\n", $len;
   $ind .= "  ";
-  my $flipflop = 0;
   while ($len--) {
-    printf  "$fmt2%s:\n",("") x $lead_items, $ind, ($flipflop++ %2 == 1 ? "VALUE" : "KEY");
+    printf  "$fmt2%s:\n",("") x $lead_items, $ind, "KEY";
+    parse_sv($ind."  ");
+    printf  "$fmt2%s:\n",("") x $lead_items, $ind,  "VALUE";
     parse_sv($ind."  ");
   }
 }
@@ -285,13 +295,13 @@ sub varint {
   my $x = 0;
   my $lshift = 0;
   while (length($data) && ord(substr($data, 0, 1)) & 0x80) {
-    my $c = ord(substr($data, 0, 1, ''));
+    my $c = ord(_chop_data_prefix( 1 ));
     $done .= chr($c);
     $x += ($c & 0x7F) << $lshift;
     $lshift += 7;
   }
   if (length($data)) {
-    my $c = ord(substr($data, 0, 1, ''));
+    my $c = ord(_chop_data_prefix( 1 ));
     $done .= chr($c);
     $x += $c << $lshift;
   }

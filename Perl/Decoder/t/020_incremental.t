@@ -1,8 +1,6 @@
 #!perl
 use strict;
 use warnings;
-use Sereal::Decoder qw(decode_sereal);
-use Sereal::Decoder::Constants qw(:all);
 use Data::Dumper;
 use File::Spec;
 use Devel::Peek;
@@ -14,8 +12,10 @@ BEGIN {
 }
 
 use Sereal::TestSet qw(:all);
+use Test::More tests => 8 + (2*6) + ( 31 * 3 );
+use Sereal::Decoder qw(decode_sereal);
+use Sereal::Decoder::Constants qw(:all);
 
-use Test::More tests => 8 + 6 + ( 31 * 3 );
 
 # Simple test to see whether we can get the number of bytes consumed
 # and whether offset works
@@ -46,6 +46,20 @@ SCOPE: {
     }
 
     is($data, '', "Data is gone after incremental parsing");
+}
+
+SCOPE: {
+    my $d = Sereal::Decoder->new({incremental => 1});
+    my $data = '';
+    $data .= SRL_MAGIC_STRING . chr(1).chr(0).chr(SRL_HDR_POS | $_) for 1..5;
+    utf8::upgrade($data);
+
+    for (1..5) {
+      my $out = $d->decode($data);
+      is("$out", "$_", "Incremental section no. $_ yields right output utf8 mode");
+    }
+
+    is($data, '', "Data is gone after incremental parsing utf8 mode");
 }
 
 SKIP: {

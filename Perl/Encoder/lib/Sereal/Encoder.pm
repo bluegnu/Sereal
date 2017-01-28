@@ -5,7 +5,7 @@ use warnings;
 use Carp qw/croak/;
 use XSLoader;
 
-our $VERSION = '3.005_001'; # Don't forget to update the TestCompat set for testing against installed decoders!
+our $VERSION = '3.015'; # Don't forget to update the TestCompat set for testing against installed decoders!
 our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
 
 # not for public consumption, just for testing.
@@ -16,9 +16,52 @@ sub _test_compat {return(@$TestCompat, $VERSION)}
 # Make sure to keep these constants in sync with the C code in srl_encoder.c.
 # I know they could be exported from C using things like ExtUtils::Constant,
 # but that's too much of a hassle for just three numbers.
-use constant SRL_UNCOMPRESSED => 0;
-use constant SRL_SNAPPY       => 1;
-use constant SRL_ZLIB         => 2;
+use constant {
+    SRL_UNCOMPRESSED => 0,
+    SRL_SNAPPY       => 1,
+    SRL_ZLIB         => 2,
+};
+use constant #begin generated
+{
+  'SRL_F_ALIASED_DEDUPE_STRINGS' => 4096,
+  'SRL_F_CANONICAL_REFS' => 32768,
+  'SRL_F_COMPRESS_SNAPPY' => 64,
+  'SRL_F_COMPRESS_SNAPPY_INCREMENTAL' => 128,
+  'SRL_F_COMPRESS_ZLIB' => 256,
+  'SRL_F_CROAK_ON_BLESS' => 4,
+  'SRL_F_DEDUPE_STRINGS' => 2048,
+  'SRL_F_ENABLE_FREEZE_SUPPORT' => 16384,
+  'SRL_F_NOWARN_UNKNOWN_OVERLOAD' => 512,
+  'SRL_F_NO_BLESS_OBJECTS' => 8192,
+  'SRL_F_REUSE_ENCODER' => 2,
+  'SRL_F_SHARED_HASHKEYS' => 1,
+  'SRL_F_SORT_KEYS' => 1024,
+  'SRL_F_SORT_KEYS_PERL' => 65536,
+  'SRL_F_SORT_KEYS_PERL_REV' => 131072,
+  'SRL_F_STRINGIFY_UNKNOWN' => 16,
+  'SRL_F_UNDEF_UNKNOWN' => 8,
+  'SRL_F_WARN_UNKNOWN' => 32,
+  '_FLAG_NAME' => [
+                    'SHARED_HASHKEYS',
+                    'REUSE',
+                    'CROAK_ON_BLESS',
+                    'UNDEF_UNKNOWN',
+                    'STRINGIFY_UNKNOWN',
+                    'WARN_UNKNOWN',
+                    'COMPRESS_SNAPPY',
+                    'COMPRESS_SNAPPY_INCREMENTAL',
+                    'COMPRESS_ZLIB',
+                    'NOWARN_UNKNOWN_OVERLOAD',
+                    'SORT_KEYS',
+                    'DEDUPE_STRINGS',
+                    'ALIASED_DEDUPE_STRINGS',
+                    'NO_BLESS_OBJECTS',
+                    'ENABLE_FREEZE_SUPPORT',
+                    'CANONICAL_REFS',
+                    'SORT_KEYS_PERL',
+                    'SORT_KEYS_PERL_REV'
+                  ]
+}; #end generated
 
 use Exporter 'import';
 our @EXPORT_OK = qw(
@@ -36,6 +79,29 @@ our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
 sub CLONE_SKIP {1}
 
 XSLoader::load('Sereal::Encoder', $XS_VERSION);
+
+sub encode_to_file {
+    my ($self, $file, $struct, $append)= @_;
+    my $mode= $append ? ">>" : ">";
+    open my $fh, $mode, $file
+        or die "Failed to open '$file' for " . ($append ? "append" : "write") . ": $!";
+    print $fh $self->encode($struct)
+        or die "Failed to print to '$file': $!";
+    close $fh
+        or die "Failed to close '$file': $!";
+}
+
+my $flags= sub {
+    my ($int, $ary)= @_;
+    return map {
+        ($ary->[$_] and $int & (1 << $_)) ? $ary->[$_] : ()
+    } (0..$#$ary);
+};
+
+sub flag_names {
+    my ($self, $val)= @_;
+    return $flags->(defined $val ? $val : $self->flags, _FLAG_NAME);
+}
 
 1;
 
@@ -236,7 +302,7 @@ do so.
 Do note that the setting is somewhat approximate. Setting it to 10000 may break at
 somewhere between 9997 and 10003 nested structures depending on their types.
 
-=head3 canoncial
+=head3 canonical
 
 Enable all options which are related to producing canonical output, so that
 two strucutures with similar contents produce the same serialized form.
@@ -255,7 +321,7 @@ in a future release by enabling other options than those listed here.
 Normally C<Sereal::Encoder> will ARRAYREF and HASHREF tags when the item contains
 less than 16 items, and and is not referenced more than once. This flag will
 override this optimization and use a standard REFN ARRAY style tag output. This
-is primarily useful for producing canoncial output and for testing Sereal itself.
+is primarily useful for producing canonical output and for testing Sereal itself.
 
 See L</CANONICAL REPRESENTATION> for why you might want to use this, and
 for the various caveats involved.
@@ -275,11 +341,23 @@ variables on use, and some of its rules are a little arcane (for instance utf8
 keys), and so two hashes that might appear to be the same might still produce
 different output as far as Sereal is concerned.
 
-The thusly allocated encoder object and its output buffer will be reused
-between invocations of C<encode()>, so hold on to it for an efficiency
-gain if you plan to serialize multiple similar data structures, but destroy
-it if you serialize a single very large data structure just once to free
-the memory.
+As of 3.006_007 (prerelease candidate for 3.007) the sort order has been changed
+to the following: order by length of keys (in bytes) ascending, then by byte
+order of the raw underlying string, then by utf8ness, with non-utf8 first. This
+order was chosen because it is the most efficient to implement, both in terms
+of memory and time. This sort order is enabled when sort_keys is set to 1.
+
+You may also produce output in Perl "cmp" order, by setting sort_keys to 2.
+And for backwards compatibility you may also produce output in reverse Perl
+"cmp" order by setting sort_keys to 3. Prior to 3.006_007 this was the
+only sort order possible, although it was not explicitly defined what it was.
+
+Note that comparatively speaking both of the "cmp" sort orders are slow and
+memory inefficient. Unless you have a really good reason stick to the default
+which is fast and as lean as possible.
+
+Unless you are concerned with "cross process canonical representation" then
+it doesn't matter what option you choose. 
 
 See L</CANONICAL REPRESENTATION> for why you might want to use this, and
 for the various caveats involved.
@@ -524,7 +602,7 @@ several other modes which may also be enabled independently, and as and when
 we add new options to the encoder that would assist in this regard then
 the C<canonical> will also enable them. These options may come with a
 performance penalty so care should be taken to read the Changes file and
-test the peformance implications when upgrading a system that uses this
+test the performance implications when upgrading a system that uses this
 option.
 
 It is important to note that using canonical representation to determine
@@ -692,6 +770,51 @@ In a nutshell, the C<canonical> option may be sufficient for an application
 which is simply serializing a cache key, and thus there's little harm in an
 occasional false-negative, but think carefully before applying Sereal in other
 use-cases.
+
+=head1 KNOWN ISSUES
+
+=over 4
+
+=item Strings Or Numbers
+
+Perl does not make a strong distinction between strings and numbers, and from
+an internal point of view it can be difficult to tell what the "right"
+representation is for a given variable.
+
+Sereal tries to not be lossy. So if it detects that the string value of a var,
+and the numeric value are different it will generally round trip the *string*
+value. This means that "special" strings often used in Perl function returns,
+like "0 but true", and "0e0", will round trip in a way that their normal Perl
+semantics are preserved. However this also means that "non canonical" values,
+like " 100 ", which will numify as 100 without warnings, will round trip as
+their string values.
+
+Perl also has some operators, the binary operators, ^, | and &, which do different
+things depending on whether their arguments had been used in numeric context as
+the following examples show:
+
+    perl -le'my $x="1"; $i=int($x); print unpack "H*", $x ^ "1"'
+    30
+
+    perl -le'my $x="1"; print unpack "H*", $x ^ "1"'
+    00
+
+    perl -le'my $x=" 1 "; $i=int($x); print unpack "H*", $x ^ "1"'
+    30
+
+    perl -le'my $x=" 1 "; print unpack "H*", $x ^ "1"'
+    113120
+
+Sereal currently cannot round trip this property properly.
+
+An extreme case of this problem is that of "dualvars", which can be created using
+the Scalar::Util::dualvar() function. This function allows one to create variables
+which have string and integer values which are completely unrelated to each other.
+Sereal currently will choose the *string* value when it detects these items.
+
+It is possible that a future release of the protocol will fix these issues.
+
+=back
 
 =head1 BUGS, CONTACT AND SUPPORT
 

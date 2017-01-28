@@ -1,9 +1,16 @@
 #!perl
 use strict;
 use warnings;
-use Sereal::Encoder qw(encode_sereal);
+use File::Spec;
+use lib File::Spec->catdir(qw(t lib));
+BEGIN {
+    lib->import('lib')
+        if !-d 't';
+}
+use Sereal::TestSet;
 use Test::More;
-
+use Sereal::Encoder qw(encode_sereal);
+use version;
 my %tests = (
     # IMPORTANT: If you add new types of cases here please update the
     # "CANONICAL REPRESENTATION" documentation.
@@ -33,7 +40,7 @@ eval {
         unless version->new(Test::Deep->VERSION) >= version->new('0.110');
     1;
 } or do {
-    my $error = $@ // "Zombie Error";
+    my $error = $@ || "Zombie Error";
     plan skip_all => "We are skipping all our tests because we don't have a suitable Test::Deep here, got error: $error";
 };
 plan tests => keys(%tests) * 2;

@@ -3,8 +3,30 @@ use strict;
 use warnings;
 
 use ExtUtils::MakeMaker;
+use Cwd;
+our $VERSION = '3.015';
 
-our $VERSION = '3.005_001';
+my $shared_dir = "../shared";
+my $its_our_repo_file= "../this_is_the_Sereal_repo.txt";
+my $in_source_repo =(       -d "../../.git"
+                        and -d $shared_dir
+                        and -e "../this_is_the_Sereal_repo.txt"
+                );
+
+
+unshift @INC, ".", "./inc";
+unshift @INC, $shared_dir, "$shared_dir/inc"
+    if $in_source_repo;
+
+if ($in_source_repo) {
+    eval "use blib '../Encoder/blib'; use blib '../Decoder/blib'; 1"
+        or die "While building in Sereal.git, failed to use blib: $@\n",
+               "You probably need to run `make` in the Encoder and Decoder directories\n";
+}
+
+my $module = "Sereal";
+require inc::Sereal::BuildTools;
+inc::Sereal::BuildTools::link_files($shared_dir,"tests_only") if $in_source_repo;
 
 # See lib/ExtUtils/MakeMaker.pm for details of how to influence
 # the contents of the Makefile that is written.
@@ -25,6 +47,11 @@ WriteMakefile1(
         'Test::More' => 0.88,
         'Sereal::Encoder' => $VERSION,
         'Sereal::Decoder' => $VERSION,
+        'Scalar::Util' => 0,
+        'File::Spec' => 0,
+        'Test::LongString' => '0',
+        'Test::Warn' => '0',
+        'Data::Dumper' => '0',
     },
     NAME              => 'Sereal',
     VERSION_FROM      => 'lib/Sereal.pm', # finds $VERSION
@@ -35,6 +62,9 @@ WriteMakefile1(
     LICENSE => 'perl',
     ABSTRACT_FROM => 'lib/Sereal.pm',
     AUTHOR => 'Steffen Mueller <smueller@cpan.org>',
+    test              => {
+        TESTS => "t/*.t t/*/*/*.t",
+    },
 );
 
 sub WriteMakefile1 {  #Written by Alexandr Ciornii, version 0.20. Added by eumm-upgrade.

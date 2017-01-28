@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -305,12 +306,17 @@ func TestStructs(t *testing.T) {
 	type ATags struct {
 		Name     string `sereal:"Phone"`
 		Phone    string `sereal:"Name"`
-		Siblings int    // no tag, isn't unpacked
+		Siblings int    `sereal:"-"` // don't serialize
 	}
 
 	type ALowerTags struct {
 		Name  string `sereal:"name"`
 		Phone string `sereal:"phone"`
+	}
+
+	type BInt int
+	type AInt struct {
+		B BInt
 	}
 
 	tests := []struct {
@@ -390,6 +396,12 @@ func TestStructs(t *testing.T) {
 			nested{nested1{Afoo}},
 			nested{},
 			nested{nested1{Afoo}},
+		},
+		{
+			"struct with int field",
+			AInt{B: BInt(3)},
+			AInt{},
+			AInt{B: BInt(3)},
 		},
 	}
 
@@ -474,6 +486,67 @@ func TestDecodeToStruct(t *testing.T) {
 
 	if !reflect.DeepEqual(exp, slice) {
 		t.Errorf("failed decode into struct:\n\nexp: %#v:\n\ngot %#v\n", exp, slice)
+	}
+}
+
+func TestStructsWithPtrs(t *testing.T) {
+	type First struct{ I int }
+	type Second struct{ S string }
+	type NestedPtr struct {
+		A *First
+		B *Second
+	}
+	tests := []struct {
+		what     string
+		input    interface{}
+		outvar   interface{}
+		expected interface{}
+	}{
+		{
+			"struct with two fields of different types",
+			NestedPtr{&First{1}, &Second{"two"}},
+			NestedPtr{},
+			NestedPtr{&First{1}, &Second{"two"}},
+		},
+		{
+			"struct with two nils of different types",
+			NestedPtr{},
+			NestedPtr{},
+			NestedPtr{},
+		},
+	}
+
+	e := &Encoder{}
+	d := &Decoder{}
+
+	for _, v := range tests {
+
+		rinput := reflect.ValueOf(v.input)
+
+		x, err := e.Marshal(rinput.Interface())
+		if err != nil {
+			t.Errorf("error marshalling %s: %s\n", v.what, err)
+			continue
+		}
+
+		routvar := reflect.New(reflect.TypeOf(v.outvar))
+		routvar.Elem().Set(reflect.ValueOf(v.outvar))
+
+		err = d.Unmarshal(x, routvar.Interface())
+		if err != nil {
+			t.Errorf("error unmarshalling %s: %s\n", v.what, err)
+			continue
+		}
+
+		for i := 0; i < routvar.Elem().NumField(); i++ {
+			outfield := routvar.Elem().Field(i)
+			outfield.Interface()
+			expfield := reflect.ValueOf(v.expected).Field(i)
+
+			if !reflect.DeepEqual(outfield.Interface(), expfield.Interface()) {
+				t.Errorf("roundtrip mismatch for %s: got: %#v expected: %#v\n", v.what, outfield.Interface(), expfield.Interface())
+			}
+		}
 	}
 }
 
@@ -622,5 +695,246 @@ func TestUnmarshalHeaderError(t *testing.T) {
 			t.Errorf("test case #%v:\ngot   : %v\nwanted: %v", i, got, wanted)
 			continue
 		}
+	}
+}
+
+func TestPrepareFreezeRoundtrip(t *testing.T) {
+	_, err := os.Stat("test_freeze")
+	if os.IsNotExist(err) {
+		return
+	}
+
+	now := time.Now()
+
+	type StructWithTime struct{ time.Time }
+
+	tests := []struct {
+		what     string
+		input    interface{}
+		outvar   interface{}
+		expected interface{}
+	}{
+
+		{
+			"Time",
+			now,
+			time.Time{},
+			now,
+		},
+		{
+			"Time_ptr",
+			&now,
+			&time.Time{},
+			&now,
+		},
+		{
+			"struct_Time",
+			StructWithTime{now},
+			StructWithTime{},
+			StructWithTime{now},
+		},
+		{
+			"struct_Time_ptr",
+			&StructWithTime{now},
+			&StructWithTime{},
+			&StructWithTime{now},
+		},
+	}
+
+	for _, compat := range []bool{false, true} {
+		for _, v := range tests {
+			e := Encoder{PerlCompat: compat}
+			d := Decoder{}
+
+			var name string
+			if compat {
+				name = "compat_" + v.what
+			} else {
+				name = v.what
+			}
+
+			rinput := reflect.ValueOf(v.input)
+
+			x, err := e.Marshal(rinput.Interface())
+			if err != nil {
+				t.Errorf("error marshalling %s: %s\n", v.what, err)
+				continue
+			}
+
+			err = ioutil.WriteFile("test_freeze/"+name+"-go.out", x, 0600)
+			if err != nil {
+				t.Error(err)
+			}
+
+			routvar := reflect.New(reflect.TypeOf(v.outvar))
+			routvar.Elem().Set(reflect.ValueOf(v.outvar))
+
+			err = d.Unmarshal(x, routvar.Interface())
+			if err != nil {
+				t.Errorf("error unmarshalling %s: %s\n", v.what, err)
+				continue
+			}
+
+			if !reflect.DeepEqual(routvar.Elem().Interface(), v.expected) {
+				t.Errorf("roundtrip mismatch for %s: got: %#v expected: %#v\n", v.what, routvar.Elem().Interface(), v.expected)
+			}
+		}
+	}
+}
+
+func TestFreezeRoundtrip(t *testing.T) {
+	if os.Getenv("RUN_FREEZE") == "1" {
+		d := Decoder{}
+
+		buf, err := ioutil.ReadFile("test_freeze/Time-go.out")
+		if err != nil {
+			t.Error(err)
+		}
+		var then time.Time
+		d.Unmarshal(buf, &then)
+
+		type StructWithTime struct{ time.Time }
+		tests := []struct {
+			what     string
+			outvar   interface{}
+			expected interface{}
+		}{
+
+			{
+				"Time",
+				time.Time{},
+				then,
+			},
+			{
+				"Time_ptr",
+				&time.Time{},
+				&then,
+			},
+			{
+				"struct_Time",
+				StructWithTime{},
+				StructWithTime{then},
+			},
+			{
+				"struct_Time_ptr",
+				&StructWithTime{},
+				&StructWithTime{then},
+			},
+		}
+
+		for _, v := range tests {
+			for _, compat := range []string{"", "compat_"} {
+				x, err := ioutil.ReadFile("test_freeze/" + compat + v.what + "-perl.out")
+				if err != nil {
+					t.Error(err)
+				}
+
+				routvar := reflect.New(reflect.TypeOf(v.outvar))
+				routvar.Elem().Set(reflect.ValueOf(v.outvar))
+
+				err = d.Unmarshal(x, routvar.Interface())
+				if err != nil {
+					t.Errorf("error unmarshalling %s: %s\n", v.what, err)
+					continue
+				}
+
+				if !reflect.DeepEqual(routvar.Elem().Interface(), v.expected) {
+					t.Errorf("roundtrip mismatch for %s: got: %#v expected: %#v\n", v.what, routvar.Elem().Interface(), v.expected)
+				}
+			}
+		}
+
+	}
+}
+
+func TestIssue130(t *testing.T) {
+	t.Skip("Issue 130")
+
+	type AStructType struct {
+		EmptySlice  []*AStructType
+		EmptySlice2 []AStructType
+	}
+
+	t1 := &AStructType{}
+
+	b, err := Marshal(t1)
+	if err != nil {
+		t.Fatal("failed to marshal:", err)
+	}
+
+	t12 := &AStructType{}
+	err = Unmarshal(b, &t12)
+	if err != nil {
+		t.Fatal("failed to unmarshal:", err)
+	}
+
+	if !reflect.DeepEqual(t1, t12) {
+		t.Errorf("roundtrip slice pointers failed\nwant\n%#v\ngot\n%#v", t1, t12)
+	}
+}
+
+func TestIssue131(t *testing.T) {
+	type A struct {
+		T *time.Time
+	}
+
+	t0 := time.Now()
+	a := A{T: &t0}
+
+	b, err := Marshal(&a)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded A
+	err = Unmarshal(b, &decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIssue135(t *testing.T) {
+	type A struct {
+		M map[string][]int
+	}
+
+	u := A{M: make(map[string][]int)}
+
+	u.M["k99"] = []int{1, 2, 3}
+
+	b, err := Marshal(&u)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var decoded A
+	err = Unmarshal(b, &decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+type errorsInMarshal struct{}
+
+func (errorsInMarshal) MarshalBinary() ([]byte, error) {
+	return nil, errors.New("this object refuses to serialize")
+}
+
+func TestIssue150(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			// may happen due to bounds check
+			t.Fatalf("shouldn't panic with bounds error: recovered %v", r)
+		}
+	}()
+
+	b, err := Marshal(errorsInMarshal{})
+
+	if b != nil {
+		t.Fatal("Should not have serialized anything")
+	}
+
+	if err == nil || err.Error() != "this object refuses to serialize" {
+		t.Fatalf("should get error from inner marshal call, got %v", err)
 	}
 }

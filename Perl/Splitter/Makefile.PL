@@ -6,19 +6,22 @@ use warnings;
 use ExtUtils::MakeMaker;
 use Config;
 
+# this is boiler plate init code borrowed from the Encoder/Decoder
+# we do not use that much of it, except for link_files() below, which
+# we use differently from Encoder/Decoder as we do not want the shared
+# tests. we could probably manage this stuff better.
 my $shared_dir = "../shared";
-my $in_source_repo = -d "../../.git" and -d $shared_dir;
+my $in_source_repo = -d "../../.git" && -d $shared_dir;
 
 my $module = "Sereal::Splitter";
 
- unshift @INC, ".", "./inc";
- unshift @INC, $shared_dir, "$shared_dir/inc" if $in_source_repo;
- require inc::Sereal::BuildTools;
- inc::Sereal::BuildTools::link_files($shared_dir) if $in_source_repo;
- inc::Sereal::BuildTools::generate_constant_includes($module) if $in_source_repo;
+unshift @INC, ".", "./inc";
+unshift @INC, $shared_dir, "$shared_dir/inc" if $in_source_repo;
+require inc::Sereal::BuildTools;
+inc::Sereal::BuildTools::link_files($shared_dir,"without_tests") if $in_source_repo;
+inc::Sereal::BuildTools::generate_constant_includes($module) if $in_source_repo;
 
-`rm -rf t/004_testset.t t/700_roundtrip t/data t/lib`;
-our $OPTIMIZE;
+my $optimize = inc::Sereal::BuildTools::build_optimize({ catch_violations => 0 });
 
 # TODO Configure/optimize for miniz:
 #   * Important: For best perf. be sure to customize the below macros for your target platform:
@@ -26,32 +29,7 @@ our $OPTIMIZE;
 #     #define MINIZ_LITTLE_ENDIAN 1
 #     #define MINIZ_HAS_64BIT_REGISTERS 1
 
-my $defines = join " ", map "-D$_", grep exists $ENV{$_}, qw(NOINLINE DEBUG MEMDEBUG NDEBUG);
-if ($Config{gccversion}) {
-    $OPTIMIZE = '-O3 -Wall -W';
-} elsif ($Config{osname} eq 'MSWin32') {
-    $OPTIMIZE = '-O2 -W4';
-} else {
-    $OPTIMIZE = $Config{optimize};
-}
-
-if ($ENV{DEBUG}) {
-  $OPTIMIZE .= ' -g';
-}
-else {
-  $defines .= " -DNDEBUG";
-}
-
-# TODO: This is identical with Encoder.
-if ($Config{osname} eq 'hpux' && not $Config{gccversion}) {
-  # HP-UX cc does not support inline.
-  # Or rather, it does, but it depends on the compiler flags,
-  # assumedly -AC99 instead of -Ae would work.
-  # But we cannot change the compiler config too much from
-  # the one that was used to compile Perl,
-  # so we just fake the inline away.
-  $defines .= " -Dinline= ";
-}
+my $defines = inc::Sereal::BuildTools::build_defines();
 
 # See lib/ExtUtils/MakeMaker.pm for details of how to influence
 # the contents of the Makefile that is written.
@@ -87,13 +65,13 @@ WriteMakefile1(
     LIBS              => [''], # e.g., '-lm'
     DEFINE            => $defines,
     INC               => '-I.', # e.g., '-I. -I/usr/include/other'
-    OPTIMIZE          => $OPTIMIZE,
+    OPTIMIZE          => $optimize,
     OBJECT            => '$(O_FILES)',
     test              => {
         TESTS => "t/*.t t/*/*/*.t"
     },
 );
-$ENV{OPTIMIZE} = $OPTIMIZE;
+$ENV{OPTIMIZE} = $optimize;
 
 sub WriteMakefile1 {  #Written by Alexandr Ciornii, version 0.20. Added by eumm-upgrade.
     my %params=@_;

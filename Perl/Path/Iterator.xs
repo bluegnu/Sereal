@@ -19,7 +19,7 @@ new(CLASS, src = NULL, opt = NULL)
     HV *opt;
   CODE:
     RETVAL = srl_build_iterator_struct(aTHX_ opt);
-    if (src) srl_iterator_set_document(aTHX_ RETVAL, src);
+    if (src) srl_iterator_set(aTHX_ RETVAL, src);
   OUTPUT: RETVAL
 
 void
@@ -29,17 +29,29 @@ DESTROY(iter)
     srl_destroy_iterator(aTHX_ iter);
 
 void
-set_document(iter, src)
+set(iter, src)
     srl_iterator_t *iter;
     SV *src;
   CODE:
-    srl_iterator_set_document(aTHX_ iter, src);
+    srl_iterator_set(aTHX_ iter, src);
 
 void
 reset(iter)
     srl_iterator_t *iter;
   CODE:
     srl_iterator_reset(aTHX_ iter);
+
+void
+unite(iter)
+    srl_iterator_t *iter;
+  CODE:
+    srl_iterator_unite(aTHX_ iter);
+
+void
+disjoin(iter)
+    srl_iterator_t *iter;
+  CODE:
+    srl_iterator_disjoin(aTHX_ iter);
 
 UV
 eof(iter)
@@ -69,14 +81,20 @@ step_out(iter, n = NULL)
   CODE:
     srl_iterator_step_out(aTHX_ iter, n ? SvUV(n) : 1);
 
-UV
-srl_next_until_depth_and_idx(iter, depth, idx)
+void
+until(iter, depth, idx)
     srl_iterator_t *iter;
     UV depth;
     U32 idx;
   CODE:
-    RETVAL = srl_iterator_next_until_depth_and_idx(aTHX_ iter, depth, idx);
-  OUTPUT: RETVAL
+    srl_iterator_until(aTHX_ iter, depth, idx);
+
+void
+rewind(iter, n = NULL)
+    srl_iterator_t *iter;
+    SV *n;
+  CODE:
+    srl_iterator_rewind(aTHX_ iter, n ? SvUV(n) : 1);
 
 UV
 offset(iter)

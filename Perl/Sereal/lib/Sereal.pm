@@ -2,21 +2,71 @@ package Sereal;
 use 5.008;
 use strict;
 use warnings;
-our $VERSION = '3.005_001';
+our $VERSION = '3.015';
 our $XS_VERSION = $VERSION; $VERSION= eval $VERSION;
-use Sereal::Encoder 3.005_001 qw(encode_sereal sereal_encode_with_object);
-use Sereal::Decoder 3.005_001 qw(decode_sereal looks_like_sereal sereal_decode_with_object);
+use Sereal::Encoder 3.015 qw(encode_sereal sereal_encode_with_object);
+use Sereal::Decoder 3.015 qw(
+    decode_sereal looks_like_sereal decode_sereal_with_header_data
+    scalar_looks_like_sereal
+    sereal_decode_with_object sereal_decode_with_header_with_object
+    sereal_decode_only_header_with_object
+    sereal_decode_only_header_with_offset_with_object
+    sereal_decode_with_header_and_offset_with_object
+    sereal_decode_with_offset_with_object
+);
 
 use Exporter 'import';
 our @EXPORT_OK = qw(
+  get_sereal_decoder
+  get_sereal_encoder
+  clear_sereal_object_cache
+
   encode_sereal decode_sereal
+  write_sereal read_sereal
   looks_like_sereal
   sereal_encode_with_object
   sereal_decode_with_object
+  decode_sereal_with_header_data
+  scalar_looks_like_sereal
+  sereal_decode_with_header_with_object
+  sereal_decode_only_header_with_object
+  sereal_decode_only_header_with_offset_with_object
+  sereal_decode_with_header_and_offset_with_object
+  sereal_decode_with_offset_with_object
 );
 our %EXPORT_TAGS = (all => \@EXPORT_OK);
 # export by default if run from command line
 our @EXPORT = ((caller())[1] eq '-e' ? @EXPORT_OK : ());
+
+our %ENCODERS;
+our %DECODERS;
+
+sub _key { join "\t", map { $_ => $_[0]->{$_} } sort keys %{$_[0]} }
+
+sub clear_sereal_object_cache {
+    %ENCODERS= ();
+    %DECODERS= ();
+}
+
+sub get_sereal_encoder {
+    my ($opts)= @_;
+    return $ENCODERS{_key($opts)} ||= Sereal::Encoder->new($opts);
+}
+
+sub get_sereal_decoder {
+    my ($opts)= @_;
+    return $DECODERS{_key($opts)} ||= Sereal::Decoder->new($opts);
+}
+
+sub write_sereal {
+    my ($file, $struct, $append, $opts)= @_;
+    get_sereal_encoder($opts)->write_to_file($file, $_[1], $append);
+}
+
+sub read_sereal {
+    my ($file, $opts)= @_;
+    get_sereal_decoder($opts)->read_from_file($file,$_[2]);
+}
 
 1;
 
@@ -43,7 +93,7 @@ Sereal - Fast, compact, powerful binary (de-)serialization
 
 I<Sereal> is an efficient, compact-output, binary and feature-rich
 serialization protocol. The Perl encoder is implemented as the
-L<Sereal::Encoder> module, the Perl decoder correspondingly as 
+L<Sereal::Encoder> module, the Perl decoder correspondingly as
 L<Sereal::Decoder>. They are distributed separately to allow for
 safe upgrading without downtime. (Hint: Upgrade the decoder everywhere
 first, then the encoder.)

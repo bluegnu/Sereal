@@ -62,11 +62,17 @@ extern "C" {
 #   define SRL_PATH_TRACE(msg, args...)
 #endif
 
-#define CLEAN_RESULTS(p) STMT_START {   \
+#define CLEAR_RESULTS(p) STMT_START {   \
     if ((p)->results) {                 \
         SvREFCNT_dec((p)->results);     \
         (p)->results = NULL;            \
     }                                   \
+} STMT_END
+
+#define CLEAR_ITERATOR(p) STMT_START {       \
+    if ((p)->iter && (p)->i_own_iterator) {  \
+        srl_destroy_iterator(aTHX_ p->iter); \
+    }                                        \
 } STMT_END
 
 SRL_STATIC_INLINE void srl_parse_next(pTHX_ srl_path_t *path, int expr_idx, SV *route);
@@ -103,6 +109,7 @@ srl_build_path_struct(pTHX_ HV *opt)
     path->iter = NULL;
     path->expr = NULL;
     path->results = NULL;
+    path->i_own_iterator = 0;
 
     if (opt != NULL) {}
     return path;
@@ -111,28 +118,27 @@ srl_build_path_struct(pTHX_ HV *opt)
 void
 srl_destroy_path(pTHX_ srl_path_t *path)
 {
-    CLEAN_RESULTS(path);
-
-    if (path->iter)
-        srl_destroy_iterator(aTHX_ path->iter);
-
+    CLEAR_RESULTS(path);
+    CLEAR_ITERATOR(path);
     Safefree(path);
-    return;
 }
 
 void
-srl_path_reset(pTHX_ srl_path_t *path, SV *src)
+srl_path_set(pTHX_ srl_path_t *path, SV *src)
 {
     path->expr = NULL;
-    CLEAN_RESULTS(path);
+    CLEAR_RESULTS(path);
+    CLEAR_ITERATOR(path);
 
-    if (path->iter) srl_destroy_iterator(aTHX_ path->iter);
-    path->iter = srl_build_iterator_struct(aTHX_ NULL);
-
-    if (sv_isa(src, "Sereal::Path::Iterator")) {
-        croak("not implemented");
+    if (sv_isobject(src) && sv_isa(src, "Sereal::Path::Iterator")) {
+        path->iter = INT2PTR(srl_iterator_ptr, SvIV((SV*) SvRV(src)));
+        path->i_own_iterator = 0;
+    } else if (SvPOK(src)) {
+        path->iter = srl_build_iterator_struct(aTHX_ NULL);
+        path->i_own_iterator = 1;
+        srl_iterator_set(aTHX_ path->iter, src);
     } else {
-        srl_iterator_set_document(aTHX_ path->iter, src);
+        croak("Sereal::Path: input should be either Sereal::Path::Iterator object or encoded Sereal document");
     }
 }
 
@@ -145,7 +151,7 @@ srl_path_traverse(pTHX_ srl_path_t *path, AV *expr, SV *route)
     assert(expr != NULL);
     assert(route != NULL);
 
-    CLEAN_RESULTS(path);
+    CLEAR_RESULTS(path);
 
     path->results = newAV();
     path->expr = expr;
@@ -242,21 +248,18 @@ srl_parse_hash_all(pTHX_ srl_path_t *path, int expr_idx, SV *route)
 {
     srl_iterator_ptr iter = path->iter;
     srl_iterator_stack_ptr stack_ptr = srl_iterator_stack(aTHX_ iter);
-    IV expected_depth = srl_iterator_stack_depth(aTHX_ iter);
-    I32 expected_idx = stack_ptr->idx;
-    U32 count = stack_ptr->count;
+    IV depth = srl_iterator_stack_depth(aTHX_ iter);
+    U32 length = stack_ptr->length;
     const char *item = NULL;
     STRLEN item_len;
     U32 idx;
 
-    assert(expected_idx == (I32) count); // we're at the begining
-    SRL_PATH_TRACE("parse all items in hash of size=%d at depth=%"IVdf,
-                   count, expected_depth);
+    SRL_PATH_TRACE("parse all items in hash of size=%d at depth=%"IVdf, length, depth);
 
-    for (idx = 0; idx < count; idx += 2, expected_idx -= 2) {
-        srl_iterator_next_until_depth_and_idx(aTHX_ iter, expected_depth, expected_idx);
-        assert(srl_iterator_stack(aTHX_ iter)->idx == expected_idx);
-        assert(srl_iterator_stack_depth(aTHX_ iter) == expected_depth);
+    for (idx = 0; idx < length; idx += 2) {
+        srl_iterator_until(aTHX_ iter, depth, idx);
+        assert(srl_iterator_stack_index(aTHX_ iter) == idx);
+        assert(srl_iterator_stack_depth(aTHX_ iter) == depth);
 
         item = srl_iterator_hash_key(aTHX_ iter, &item_len);
         SRL_PATH_TRACE("walk over item=%.*s in hash at depth=%"IVdf,
@@ -277,7 +280,7 @@ srl_parse_hash_list(pTHX_ srl_path_t *path, int expr_idx, SV *route,
     IV depth = srl_iterator_stack_depth(aTHX_ iter);
 
     SRL_PATH_TRACE("parse items '%.*s' in hash of size=%d at depth=%"IVdf,
-                   (int) list_len, list, srl_iterator_stack(aTHX_ iter)->count, depth);
+                   (int) list_len, list, srl_iterator_stack(aTHX_ iter)->length, depth);
 
     while (next_item_in_list(list, list_len, &item, &item_len)) {
         assert(srl_iterator_stack_depth(aTHX_ iter) == depth);
@@ -286,11 +289,11 @@ srl_parse_hash_list(pTHX_ srl_path_t *path, int expr_idx, SV *route,
         SRL_PATH_TRACE("scan for item=%.*s in hash at depth=%"IVdf,
                        (int) item_len, item, srl_iterator_stack_depth(aTHX_ iter));
 
-        if (srl_iterator_hash_exists(aTHX_ iter, item, item_len)) {
+        if (srl_iterator_hash_exists(aTHX_ iter, item, item_len) != SRL_ITER_NOT_FOUND) {
             srl_parse_next_str(aTHX_ path, expr_idx + 1, route, item, item_len);
-            srl_iterator_step_out(aTHX_ iter, srl_iterator_stack_depth(aTHX_ iter) - depth);
+            srl_iterator_rewind(aTHX_ iter, srl_iterator_stack_depth(aTHX_ iter) - depth);
         } else {
-            srl_iterator_step_out(aTHX_ iter, 0);
+            srl_iterator_rewind(aTHX_ iter, 0);
         }
     }
 }
@@ -302,10 +305,10 @@ srl_parse_hash_item(pTHX_ srl_path_t *path, int expr_idx, SV *route,
     srl_iterator_ptr iter = path->iter;
     SRL_PATH_TRACE("parse item '%.*s' in hash of size=%d at depth=%"IVdf,
                    (int) str_len, str,
-                   srl_iterator_stack(aTHX_ iter)->count,
+                   srl_iterator_stack(aTHX_ iter)->length,
                    srl_iterator_stack_depth(aTHX_ iter));
 
-    if (srl_iterator_hash_exists(aTHX_ iter, str, str_len)) {
+    if (srl_iterator_hash_exists(aTHX_ iter, str, str_len) != SRL_ITER_NOT_FOUND) {
         srl_parse_next_str(aTHX_ path, expr_idx + 1, route, str, str_len);
     }
 }
@@ -342,18 +345,15 @@ srl_parse_array_all(pTHX_ srl_path_t *path, int expr_idx, SV *route)
 {
     srl_iterator_ptr iter = path->iter;
     srl_iterator_stack_ptr stack_ptr = srl_iterator_stack(aTHX_ iter);
-    IV expected_depth  = srl_iterator_stack_depth(aTHX_ iter);
-    I32 expected_idx = stack_ptr->idx;
-    U32 count = stack_ptr->count;
+    IV depth  = srl_iterator_stack_depth(aTHX_ iter);
+    U32 length = stack_ptr->length;
     U32 idx;
 
-    assert(expected_idx == (I32) count); // we're at the begining
-    SRL_PATH_TRACE("parse all items in array of size=%d at depth=%"IVdf,
-                   count, expected_depth);
+    SRL_PATH_TRACE("parse all items in array of size=%d at depth=%"IVdf, length, depth);
 
-    for (idx = 0; idx < count; ++idx, --expected_idx) {
-        srl_iterator_next_until_depth_and_idx(aTHX_ iter, expected_depth, expected_idx);
-        assert(srl_iterator_stack_depth(aTHX_ iter) == expected_depth);
+    for (idx = 0; idx < length; ++idx) {
+        srl_iterator_until(aTHX_ iter, depth, idx);
+        assert(srl_iterator_stack_depth(aTHX_ iter) == depth);
 
         SRL_PATH_TRACE("walk over item=%d in array at depth=%d",
                        idx, (int) srl_iterator_stack_depth(aTHX_ iter));
@@ -373,7 +373,7 @@ srl_parse_array_list(pTHX_ srl_path_t *path, int expr_idx, SV *route,
     IV depth = srl_iterator_stack_depth(aTHX_ iter);
 
     SRL_PATH_TRACE("parse items '%.*s' in array of size=%d at depth=%"IVdf,
-                   (int) list_len, list, srl_iterator_stack(iter)->count, depth);
+                   (int) list_len, list, srl_iterator_stack(iter)->length, depth);
 
     while (next_item_in_list(list, list_len, &item, &item_len)) {
         assert(srl_iterator_stack_depth(aTHX_ iter) == depth);
@@ -383,9 +383,9 @@ srl_parse_array_list(pTHX_ srl_path_t *path, int expr_idx, SV *route,
         SRL_PATH_TRACE("scan for item=%d in array at depth=%"IVdf,
                        idx, srl_iterator_stack_depth(aTHX_ iter));
 
-        if (srl_iterator_array_goto(aTHX_ iter, idx)) {
+        if (srl_iterator_array_goto(aTHX_ iter, idx) != SRL_ITER_NOT_FOUND) {
             srl_parse_next_int(aTHX_ path, expr_idx + 1, route, idx);
-            srl_iterator_step_out(aTHX_ iter, srl_iterator_stack_depth(aTHX_ iter) - depth);
+            srl_iterator_rewind(aTHX_ iter, srl_iterator_stack_depth(aTHX_ iter) - depth);
         }
     }
 }
@@ -396,8 +396,7 @@ srl_parse_array_range(pTHX_ srl_path_t *path, int expr_idx, SV *route, int *rang
     I32 idx, start, stop, step;
     srl_iterator_ptr iter = path->iter;
     srl_iterator_stack_ptr stack = srl_iterator_stack(aTHX_ iter);
-    IV expected_depth = srl_iterator_stack_depth(aTHX_ iter);
-    I32 expected_idx;
+    IV depth = srl_iterator_stack_depth(aTHX_ iter);
 
     start = range[0];
     stop = range[1];
@@ -405,20 +404,18 @@ srl_parse_array_range(pTHX_ srl_path_t *path, int expr_idx, SV *route, int *rang
 
 #   define SRL_MIN(a,b) (((a)<(b))?(a):(b))
 #   define SRL_MAX(a,b) (((a)>(b))?(a):(b))
-    start = start < 0 ? SRL_MAX(0, start + (I32) stack->count) : SRL_MIN((I32) stack->count, start);
-    stop  = stop  < 0 ? SRL_MAX(0, stop  + (I32) stack->count) : SRL_MIN((I32) stack->count, stop);
+    start = start < 0 ? SRL_MAX(0, start + (I32) stack->length) : SRL_MIN((I32) stack->length, start);
+    stop  = stop  < 0 ? SRL_MAX(0, stop  + (I32) stack->length) : SRL_MIN((I32) stack->length, stop);
     step  = step ? step : 1;
 
     if (step < 0) croak("negative step in not supported");
 
     SRL_PATH_TRACE("parse items '%d:%d:%d' in array of size=%d at depth=%"IVdf,
-                   start, stop, step, stack->count, expected_depth);
+                   start, stop, step, stack->length, depth);
 
-    expected_idx = stack->idx - start;
-
-    for (idx = start; idx < stop; idx += step, expected_idx -= step) {
-        srl_iterator_next_until_depth_and_idx(aTHX_ iter, expected_depth, expected_idx);
-        assert(srl_iterator_stack_depth(aTHX_ iter) == expected_depth);
+    for (idx = start; idx < stop; idx += step) {
+        srl_iterator_until(aTHX_ iter, depth, idx);
+        assert(srl_iterator_stack_depth(aTHX_ iter) == depth);
 
         SRL_PATH_TRACE("walk over item=%d in array at depth=%d",
                        idx, (int) srl_iterator_stack_depth(aTHX_ iter));
@@ -432,9 +429,9 @@ srl_parse_array_item(pTHX_ srl_path_t *path, int expr_idx, SV *route, I32 idx)
 {
     srl_iterator_ptr iter = path->iter;
     SRL_PATH_TRACE("parse item %d in array of size=%d at depth=%"IVdf,
-                   idx, srl_iterator_stack(aTHX_ iter)->count, srl_iterator_stack_depth(aTHX_ iter));
+                   idx, srl_iterator_stack(aTHX_ iter)->length, srl_iterator_stack_depth(aTHX_ iter));
 
-    if (srl_iterator_array_goto(aTHX_ iter, idx)) {
+    if (srl_iterator_array_goto(aTHX_ iter, idx) != SRL_ITER_NOT_FOUND) {
         srl_parse_next_int(aTHX_ path, expr_idx + 1, route, idx);
     }
 }

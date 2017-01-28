@@ -121,14 +121,15 @@ SRL_STATIC_INLINE void srl_read_long_double(pTHX_ srl_decoder_t *dec, SV* into);
 SRL_STATIC_INLINE void srl_read_double(pTHX_ srl_decoder_t *dec, SV* into);
 SRL_STATIC_INLINE void srl_read_float(pTHX_ srl_decoder_t *dec, SV* into);
 SRL_STATIC_INLINE void srl_read_string(pTHX_ srl_decoder_t *dec, int is_utf8, SV* into);
-SRL_STATIC_INLINE void srl_read_varint_into(pTHX_ srl_decoder_t *dec, SV* into, SV** container);
-SRL_STATIC_INLINE void srl_read_zigzag_into(pTHX_ srl_decoder_t *dec, SV* into, SV** container);
+SRL_STATIC_INLINE void srl_read_varint_into(pTHX_ srl_decoder_t *dec, SV* into, SV** container, const U8 *track_it);
+SRL_STATIC_INLINE void srl_read_zigzag_into(pTHX_ srl_decoder_t *dec, SV* into, SV** container, const U8 *track_it);
 SRL_STATIC_INLINE void srl_read_reserved(pTHX_ srl_decoder_t *dec, U8 tag, SV* into);
 SRL_STATIC_INLINE void srl_read_object(pTHX_ srl_decoder_t *dec, SV* into, U8 obj_tag);
 SRL_STATIC_INLINE void srl_read_objectv(pTHX_ srl_decoder_t *dec, SV* into, U8 obj_tag);
 
 SRL_STATIC_INLINE void srl_track_sv(pTHX_ srl_decoder_t *dec, const U8 *track_pos, SV *sv);
 SRL_STATIC_INLINE void srl_read_frozen_object(pTHX_ srl_decoder_t *dec, HV *class_stash, SV *into);
+SRL_STATIC_INLINE SV * srl_follow_reference(pTHX_ srl_decoder_t *dec, UV offset);
 
 /* FIXME unimplemented!!! */
 SRL_STATIC_INLINE SV *srl_read_extend(pTHX_ srl_decoder_t *dec, SV* into);
@@ -334,7 +335,7 @@ srl_build_decoder_struct_alike(pTHX_ srl_decoder_t *proto)
     dec->max_recursion_depth = proto->max_recursion_depth;
     dec->max_num_hash_entries = proto->max_num_hash_entries;
 
-    if (dec->alias_cache) {
+    if (proto->alias_cache) {
         dec->alias_cache = proto->alias_cache;
         SvREFCNT_inc(dec->alias_cache);
     }
@@ -378,7 +379,7 @@ srl_decoder_destructor_hook(pTHX_ void *p)
     srl_decoder_t *dec = (srl_decoder_t *)p;
 
     /* Only free decoder if not for reuse */
-    if (!SRL_DEC_HAVE_OPTION(dec, SRL_F_REUSE_DECODER)) {
+    if (!SRL_DEC_HAVE_OPTION(dec, SRL_F_DECODER_REUSE)) {
         srl_destroy_decoder(aTHX_ dec);
     }
     else {
@@ -514,7 +515,7 @@ srl_begin_decoding(pTHX_ srl_decoder_t *dec, SV *src, UV start_offset)
     if (SRL_DEC_HAVE_OPTION(dec, SRL_F_DECODER_DIRTY)) {
         srl_decoder_t * const proto = dec;
         dec = srl_build_decoder_struct_alike(aTHX_ proto);
-        SRL_DEC_UNSET_OPTION(dec, SRL_F_REUSE_DECODER);
+        SRL_DEC_UNSET_OPTION(dec, SRL_F_DECODER_REUSE);
     }
 
     /* Needs to be before setting DIRTY because DIRTY is volatile. */
@@ -531,8 +532,13 @@ srl_begin_decoding(pTHX_ srl_decoder_t *dec, SV *src, UV start_offset)
          * make a mortal copy, and then try to downgrade the copy.
          * The downgrade will croak if it cannot successfully downgrade
          * the buffer. If it is sucessful then decode the downgraded
-         * copy. */
-        src= sv_mortalcopy(src);
+         * copy.
+         * Note, we do not make the copy when we are in destructive parsing mode
+         * as we then are expected to modify the original string.
+         */
+        if ( ! SRL_DEC_HAVE_OPTION(dec, SRL_F_DECODER_DESTRUCTIVE_INCREMENTAL) ) {
+            src= sv_mortalcopy(src);
+        }
         sv_utf8_downgrade(src, 0);
     }
 
@@ -613,7 +619,12 @@ srl_read_header(pTHX_ srl_decoder_t *dec, SV *header_user_data)
              *  - 8bit bitfield
              *  - if lowest bit set, we have custom-header-user-data after the bitfield
              *  => Only read header user data if an SV* was passed in to fill. */
-            const U8 bitfield = *(dec->buf.pos++);
+
+            U8 bitfield;
+
+            SRL_RDR_ASSERT_SPACE(dec->pbuf, 1, " while reading header flags");
+
+            bitfield = *(dec->buf.pos++);
             if (bitfield & SRL_PROTOCOL_HDR_USER_DATA && header_user_data != NULL) {
                 /* Do an actual document body deserialization for the user data: */
                 SRL_RDR_UPDATE_BODY_POS(dec->pbuf, dec->proto_version);
@@ -625,6 +636,7 @@ srl_read_header(pTHX_ srl_decoder_t *dec, SV *header_user_data)
             }
             else {
                 /* Either off in bitfield or no user data wanted, skip to end of header */
+                SRL_RDR_ASSERT_SPACE(dec->pbuf, header_len, " while reading header packet");
                 dec->buf.pos += header_len - 1; /* header_len includes bitfield */
             }
         }
@@ -733,10 +745,12 @@ SRL_STATIC_INLINE SV *
 srl_fetch_item(pTHX_ srl_decoder_t *dec, UV item, const char * const tag_name)
 {
     SV *sv= (SV *)PTABLE_fetch(dec->ref_seenhash, (void *)item);
+#ifndef FOLLOW_REFERENCES_IF_NOT_STASHED
     if (expect_false( !sv )) {
         /*srl_ptable_debug_dump(aTHX_ dec->ref_seenhash);*/
         SRL_RDR_ERRORf2(dec->pbuf, "%s(%"UVuf") references an unknown item", tag_name, item);
     }
+#endif
     return sv;
 }
 
@@ -744,7 +758,7 @@ srl_fetch_item(pTHX_ srl_decoder_t *dec, UV item, const char * const tag_name)
  * PRIVATE WORKER SUBS FOR DEPARSING                                        *
  ****************************************************************************/
 SRL_STATIC_INLINE void
-srl_alias_iv(pTHX_ srl_decoder_t *dec, SV **container, IV iv)
+srl_alias_iv(pTHX_ srl_decoder_t *dec, SV **container, const U8 *track_it, IV iv)
 {
     SV *alias;
     SV **av_array= AvARRAY(dec->alias_cache);
@@ -767,15 +781,17 @@ srl_alias_iv(pTHX_ srl_decoder_t *dec, SV **container, IV iv)
     if (*container && *container != &PL_sv_undef)
         SvREFCNT_dec(*container);
     *container= alias;
+    if (track_it)
+        srl_track_sv(aTHX_ dec, track_it, alias);
 }
 
 
 
 SRL_STATIC_INLINE void
-srl_setiv(pTHX_ srl_decoder_t *dec, SV *into, SV **container, IV iv)
+srl_setiv(pTHX_ srl_decoder_t *dec, SV *into, SV **container, const U8 *track_it, IV iv)
 {
     if ( expect_false( container && IS_IV_ALIAS(dec,iv) )) {
-        srl_alias_iv(aTHX_ dec, container, iv);
+        srl_alias_iv(aTHX_ dec, container, track_it, iv);
     } else {
         /* unroll sv_setiv() for the SVt_NULL case, which we will
          * see regularly - this wins about 35% speedup for us
@@ -804,11 +820,11 @@ srl_setiv(pTHX_ srl_decoder_t *dec, SV *into, SV **container, IV iv)
 }
 
 SRL_STATIC_INLINE void
-srl_read_varint_into(pTHX_ srl_decoder_t *dec, SV* into, SV **container)
+srl_read_varint_into(pTHX_ srl_decoder_t *dec, SV* into, SV **container, const U8 *track_it)
 {
     UV uv= srl_read_varint_uv(aTHX_ dec->pbuf);
     if (expect_true(uv <= (UV)IV_MAX)) {
-        srl_setiv(aTHX_ dec, into, container, (IV)uv);
+        srl_setiv(aTHX_ dec, into, container, track_it, (IV)uv);
     } else {
         /* grr, this is ridiculous! */
         sv_setiv(into, 0);
@@ -827,9 +843,9 @@ srl_read_zigzag_iv(pTHX_ srl_decoder_t *dec)
 }
 
 SRL_STATIC_INLINE void
-srl_read_zigzag_into(pTHX_ srl_decoder_t *dec, SV* into, SV **container)
+srl_read_zigzag_into(pTHX_ srl_decoder_t *dec, SV* into, SV **container, const U8 *track_it)
 {
-    srl_setiv(aTHX_ dec, into, container, srl_read_zigzag_iv(aTHX_ dec));
+    srl_setiv(aTHX_ dec, into, container, track_it, srl_read_zigzag_iv(aTHX_ dec));
 }
 
 
@@ -1009,10 +1025,12 @@ srl_read_hash(pTHX_ srl_decoder_t *dec, SV* into, U8 tag) {
             dec->buf.pos += key_len;
         } else if (tag == SRL_HDR_BINARY) {
             key_len= (KEYLENTYPE)srl_read_varint_uv_length(aTHX_ dec->pbuf, " while reading string/BINARY key");
+            SRL_RDR_ASSERT_SPACE(dec->pbuf,key_len," while reading binary key");
             from= dec->buf.pos;
             dec->buf.pos += key_len;
         } else if (tag == SRL_HDR_STR_UTF8) {
             key_len= (KEYLENTYPE)srl_read_varint_uv_length(aTHX_ dec->pbuf, " while reading UTF8 key");
+            SRL_RDR_ASSERT_SPACE(dec->pbuf,key_len," while reading string key");
             from= dec->buf.pos;
             dec->buf.pos += key_len;
 #ifdef OLDHASH
@@ -1061,6 +1079,11 @@ srl_read_hash(pTHX_ srl_decoder_t *dec, SV* into, U8 tag) {
 #endif
         if (expect_false( !fetched_sv )) {
             SRL_RDR_ERROR_PANIC(dec->pbuf, "failed to hv_store");
+        }
+        else
+        if ( expect_false( SvTYPE(*fetched_sv) != SVt_NULL ) ) {
+            /* sv_dump(*fetched_sv); */
+            SRL_RDR_ERRORf2(dec->pbuf, "duplicate key '%.*s' in hash", key_len, (char *)from);
         }
         srl_read_single_value(aTHX_ dec, *fetched_sv, fetched_sv );
     }
@@ -1114,6 +1137,17 @@ srl_read_refn(pTHX_ srl_decoder_t *dec, SV* into)
     }
 }
 
+SRL_STATIC_INLINE SV *
+srl_follow_reference(pTHX_ srl_decoder_t *dec, UV offset)
+{
+    SV* into = FRESH_SV();
+    srl_reader_char_ptr pos = dec->buf.pos;
+    dec->buf.pos = dec->buf.body_pos + offset;
+    srl_read_single_value(aTHX_ dec, into, NULL);
+    dec->buf.pos = pos;
+    return into;
+}
+
 SRL_STATIC_INLINE void
 srl_read_refp(pTHX_ srl_decoder_t *dec, SV* into)
 {
@@ -1126,6 +1160,12 @@ srl_read_refp(pTHX_ srl_decoder_t *dec, SV* into)
         return;
     }
     referent= srl_fetch_item(aTHX_ dec, item, "REFP");
+
+#ifdef FOLLOW_REFERENCES_IF_NOT_STASHED
+    if (referent == NULL)
+        referent = srl_follow_reference(aTHX_ dec, item);
+#endif
+
     (void)SvREFCNT_inc(referent);
 
     SRL_sv_set_rv_to(into, referent);
@@ -1246,6 +1286,7 @@ srl_read_object(pTHX_ srl_decoder_t *dec, SV* into, U8 obj_tag)
     if (IS_SRL_HDR_SHORT_BINARY(tag)) {
         key_len= SRL_HDR_SHORT_BINARY_LEN_FROM_TAG(tag);
         from= dec->buf.pos;
+        SRL_RDR_ASSERT_SPACE(dec->pbuf,key_len," while reading short binary");
         dec->buf.pos += key_len;
     }
     else
@@ -1253,12 +1294,14 @@ srl_read_object(pTHX_ srl_decoder_t *dec, SV* into, U8 obj_tag)
         key_len= srl_read_varint_uv_length(aTHX_ dec->pbuf, " while reading UTF8 class name");
         flags = flags | SVf_UTF8;
         from= dec->buf.pos;
+        SRL_RDR_ASSERT_SPACE(dec->pbuf,key_len," while reading utf8 string");
         dec->buf.pos += key_len;
     }
     else
     if (tag == SRL_HDR_BINARY) {
         key_len= srl_read_varint_uv_length(aTHX_ dec->pbuf, " while reading string/BINARY class name");
         from= dec->buf.pos;
+        SRL_RDR_ASSERT_SPACE(dec->pbuf,key_len," while reading binary");
         dec->buf.pos += key_len;
     }
     else
@@ -1297,6 +1340,9 @@ srl_read_object(pTHX_ srl_decoder_t *dec, SV* into, U8 obj_tag)
                     " while reading UTF8 string length for class name (via COPY)"
                 );
                 flags = flags | SVf_UTF8;
+                if (!is_utf8_string(from, key_len)) {
+                    SRL_RDR_ERROR_PANIC(dec->pbuf, "utf8 flagged classname is not actually utf8");
+                }
             }
             else {
                 SRL_RDR_ERROR_BAD_COPY(dec->pbuf, SRL_HDR_OBJECT);
@@ -1611,6 +1657,7 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
     STRLEN len;
     U8 tag;
     int is_ref = 0;
+    const U8 *track_it = NULL;
 
   read_again:
     if (expect_false( SRL_RDR_DONE(dec->pbuf) ))
@@ -1620,12 +1667,11 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
 
   read_tag:
     switch (tag) {
-
         CASE_SRL_HDR_POS:
-            srl_setiv(aTHX_ dec, into, container, (IV)tag);
+            srl_setiv(aTHX_ dec, into, container, track_it, (IV)tag);
             break;
         CASE_SRL_HDR_NEG:
-            srl_setiv(aTHX_ dec, into, container, (IV)(tag - 32));
+            srl_setiv(aTHX_ dec, into, container, track_it, (IV)(tag - 32));
             break;
         CASE_SRL_HDR_SHORT_BINARY:
             len= (STRLEN)SRL_HDR_SHORT_BINARY_LEN_FROM_TAG(tag);
@@ -1635,8 +1681,8 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
             break;
         CASE_SRL_HDR_HASHREF:       srl_read_hash(aTHX_ dec, into, tag);  is_ref = 1; break;
         CASE_SRL_HDR_ARRAYREF:      srl_read_array(aTHX_ dec, into, tag); is_ref = 1; break;
-        case SRL_HDR_VARINT:        srl_read_varint_into(aTHX_ dec, into, container); break;
-        case SRL_HDR_ZIGZAG:        srl_read_zigzag_into(aTHX_ dec, into, container); break;
+        case SRL_HDR_VARINT:        srl_read_varint_into(aTHX_ dec, into, container, track_it); break;
+        case SRL_HDR_ZIGZAG:        srl_read_zigzag_into(aTHX_ dec, into, container, track_it); break;
 
         case SRL_HDR_FLOAT:         srl_read_float(aTHX_ dec, into);                  break;
         case SRL_HDR_DOUBLE:        srl_read_double(aTHX_ dec, into);                 break;
@@ -1651,6 +1697,8 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
             if (container && SRL_DEC_HAVE_OPTION(dec,SRL_F_DECODER_USE_UNDEF)){
                 SvREFCNT_dec(into);
                 *container= &PL_sv_undef;
+                if ( track_it )
+                    srl_track_sv(aTHX_ dec, track_it, *container);
             } else {
                 sv_setsv(into, &PL_sv_undef);
             }
@@ -1683,6 +1731,8 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
             SvREFCNT_inc(alias);
             SvREFCNT_dec(into);
             *container= alias;
+            if (track_it)
+                srl_track_sv(aTHX_ dec, track_it, alias);
             return;
         }
         break;
@@ -1694,7 +1744,8 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
         default:
             if (tag & SRL_HDR_TRACK_FLAG) {
                 tag= tag & ~SRL_HDR_TRACK_FLAG;
-                srl_track_sv(aTHX_ dec, dec->buf.pos-1, into);
+                track_it = dec->buf.pos-1;
+                srl_track_sv(aTHX_ dec, track_it, into);
                 goto read_tag;
             } else { 
                 SRL_RDR_ERROR_UNEXPECTED(dec->pbuf, tag, " single value");
@@ -1705,15 +1756,16 @@ srl_read_single_value(pTHX_ srl_decoder_t *dec, SV* into, SV** container)
     /* they want us to set all SVs readonly, or only the non-ref */
 #define SUPPORT_READONLY 1
 #if SUPPORT_READONLY
-        if ( expect_false(dec->flags_readonly) )
-        {
-            if (
-                 dec->flags_readonly == 1 || !is_ref
-            ) {
-                SvREADONLY_on(into);
-            }
+    if ( expect_false(dec->flags_readonly) )
+    {
+        if (
+             dec->flags_readonly == 1 || !is_ref
+        ) {
+            SvREADONLY_on(into);
         }
+    }
 #endif
+
 
     return;
 }

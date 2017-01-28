@@ -5,7 +5,7 @@
 #include "perl.h"
 #include "XSUB.h"
 
-#define NEED_newSV_type
+#define NEED_newSV_type_GLOBAL
 #include "ppport.h"
 
 #include "srl_encoder.h"
@@ -53,8 +53,8 @@ THX_pp1_sereal_encode_with_object(pTHX_ U8 has_hdr)
   {
     croak("handle is not a Sereal::Encoder handle");
   }
-
-  enc= (srl_encoder_t *)SvIV(encoder_sv);
+  /* we should never have an IV smaller than a PTR */
+  enc= INT2PTR(srl_encoder_t *,SvIV(encoder_sv));
 
   if (header_sv && !SvOK(header_sv))
     header_sv = NULL;
@@ -88,14 +88,14 @@ THX_ck_entersub_args_sereal_encode_with_object(pTHX_ OP *entersubop, GV *namegv,
 
   entersubop = ck_entersub_args_proto(entersubop, namegv, ckobj);
   pushop = cUNOPx(entersubop)->op_first;
-  if (!pushop->op_sibling)
+  if (!OpHAS_SIBLING(pushop))
     pushop = cUNOPx(pushop)->op_first;
-  firstargop = pushop->op_sibling;
+  firstargop = OpSIBLING(pushop);
 
-  for (cvop = firstargop; cvop->op_sibling; cvop = cvop->op_sibling) ;
+  for (cvop = firstargop; OpHAS_SIBLING(cvop); cvop = OpSIBLING(cvop)) ;
 
   for (arity = 0, lastargop = pushop, argop = firstargop; argop != cvop;
-       lastargop = argop, argop = argop->op_sibling)
+       lastargop = argop, argop = OpSIBLING(argop))
   {
     arity++;
   }
@@ -106,8 +106,8 @@ THX_ck_entersub_args_sereal_encode_with_object(pTHX_ OP *entersubop, GV *namegv,
   /* If we get here, we can replace the entersub with a suitable
    * sereal_encode_with_object custom OP. */
 
-  pushop->op_sibling = cvop;
-  lastargop->op_sibling = NULL;
+  OpMORESIB_set(pushop, cvop);
+  OpLASTSIB_set(lastargop, op_parent(lastargop));
   op_free(entersubop);
   newop = newUNOP(OP_NULL, 0, firstargop);
   newop->op_type    = OP_CUSTOM;
@@ -132,7 +132,6 @@ THX_xsfunc_sereal_encode_with_object(pTHX_ CV *cv)
 }
 
 #define MY_CXT_KEY "Sereal::Encoder::_stash" XS_VERSION
-
 
 typedef struct {
     sv_with_hash options[SRL_ENC_OPT_COUNT];
@@ -208,6 +207,12 @@ DESTROY(enc)
   CODE:
     srl_destroy_encoder(aTHX_ enc);
 
+U32
+flags(enc)
+    srl_encoder_t *enc;
+  CODE:
+    RETVAL = enc->flags;
+  OUTPUT: RETVAL
 
 void
 encode_sereal(src, opt = NULL)
@@ -263,7 +268,7 @@ test()
       check[i] = fail;
     }
     for (i = 0; i < (UV)n; ++i) {
-      const UV res = (UV)PTABLE_fetch(tbl, INT2PTR(void *, (1000+i)));
+      const UV res = PTR2UV(PTABLE_fetch(tbl, INT2PTR(void *, (1000+i))));
       printf("%sok %u - fetch %u\n", (res == (UV)(1000+i)) ? noop : fail, (unsigned int)(1+i), (unsigned int)(i+1));
     }
     iter = PTABLE_iter_new(tbl);
@@ -279,3 +284,5 @@ test()
     }
     PTABLE_iter_free(iter);
     PTABLE_free(tbl);
+
+
